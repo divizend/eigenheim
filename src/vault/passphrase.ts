@@ -33,7 +33,7 @@ export const DICEWARE: readonly string[] = linesOf(dicewareRaw)
 /** A filtered slice of SecLists' `Pwdb_top-10000.txt` (the current
  * equivalent of the "top 10 000 common passwords" list the design spec
  * names -- the originally-named `10-million-password-list-top-10000.txt`
- * no longer exists in that repo): entries of length >=6 only, 8750 of the
+ * no longer exists in that repo): entries of length >=4 only, 9641 of the
  * original 10000.
  *
  * The plan's original filter was >=20 characters -- the length floor below
@@ -42,9 +42,23 @@ export const DICEWARE: readonly string[] = linesOf(dicewareRaw)
  * filter leaves only 5 of 10000 entries (two of them hash-like garbage),
  * which can never catch the realistic weak-but-long passphrase: a common
  * word with digits padded on to clear the length floor (e.g.
- * "password1234567890123"). Below 6 characters an entry still cannot be a
- * meaningful "stripped core" of anything (see stripNonLetterEnds below), so
- * that much of the original reasoning survives; >=20 does not. Source:
+ * "password1234567890123").
+ *
+ * The threshold below that (>=6) turned out to still be wrong, the same
+ * way: it excluded "zorro" (5 characters, a genuine top-10000 entry), so
+ * "zorro" + 15 digits (20 codepoints total) cleared the length floor,
+ * matched no bundled entry via stripNonLetterEnds, and had enough distinct
+ * digits to clear the distinct-codepoint floor too -- `checkPassphrase`
+ * returned `{ ok: true }` for it. Confirmed live before lowering the
+ * threshold (see passphrase.test.ts's regression test for this exact
+ * string). >=4 is the floor, not >=1: a 1-3 character stripped core
+ * ("i", "the", "car") would start matching common short words/function
+ * words far too eagerly, and a passphrase reduced to that short a core is
+ * already very likely to also trip the distinct-codepoint floor on its
+ * padding alone -- so >=4 is where real coverage gain stops and false-positive
+ * risk starts outweighing it. Do not raise this back to >=6 (or further)
+ * without re-reading this comment: that reopens the exact hole above.
+ * Source:
  * https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Common-Credentials/Pwdb_top-10000.txt */
 const COMMON_PASSWORDS: readonly string[] = linesOf(commonPasswordsRaw)
 

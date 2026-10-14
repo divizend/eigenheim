@@ -47,6 +47,17 @@ test("rejects a common password even when long enough", () => {
   // "password", which is in the bundled list (verified directly against it).
   expect(checkPassphrase("password1234567890123").ok).toBe(false)
 })
+test("rejects a short common password padded with digits — the case that set the >=4 bundling floor", () => {
+  // "zorro" is a genuine top-10000 entry at 5 characters. It was originally
+  // excluded by a >=6 bundling floor, which meant "zorro" + 15 digits (20
+  // codepoints total, matching rule 1's floor exactly) stripped down to
+  // "zorro" via rule 3, matched nothing in the (too-narrow) bundled list,
+  // and had 13 distinct codepoints -- comfortably clearing rule 4 too. This
+  // is exactly the hole that motivated lowering the floor to >=4: do not
+  // raise COMMON_PASSWORDS' bundling threshold back toward >=6 without
+  // re-reading that comment in passphrase.ts, or this regresses silently.
+  expect(checkPassphrase("zorro123456789012345").ok).toBe(false)
+})
 test("rejects a common password matched exactly, not just as a stripped core", () => {
   // "1q2w3e4r5t6y7u8i9o0p" is a real, >=20-character entry in the bundled
   // list (SecLists Pwdb_top-10000.txt) -- this exercises whole-string

@@ -313,9 +313,11 @@ Expected: FAIL — module not found
 
 - [ ] **Step 3: Vendor the wordlists and implement `src/vault/passphrase.ts`**
 
-`diceware.txt` is the EFF long wordlist (7776 words, one per line, the numeric prefixes stripped). `common-passwords.txt` is the top 10 000 list; filter it to entries of ≥20 characters before bundling — shorter ones are already rejected by the length rule, so shipping them is dead weight in a bundle whose size is a security property (spec §4).
+`diceware.txt` is the EFF long wordlist (7776 words, one per line, the numeric prefixes stripped). `common-passwords.txt` is sourced from `danielmiessler/SecLists`'s `Passwords/Common-Credentials/Pwdb_top-10000.txt` — the file originally named here, `10-million-password-list-top-10000.txt`, no longer exists in that repo. Fetch it via the GitHub contents API's `download_url` rather than guessing a raw URL.
 
-`generatePassphrase` draws indices from `crypto.getRandomValues` with rejection sampling. `checkPassphrase` runs `normalizePassphrase` first, then applies: codepoint length < 20 → reject; membership in the common list → reject. There is no character-set check — do not add one.
+Filter it to entries of ≥4 characters before bundling, not ≥20: measured against the real list, a ≥20 filter leaves only 5 of 10 000 entries (two of them hash-like garbage), which can't catch the realistic weak-but-long passphrase — a common word padded with digits to clear the length floor (e.g. `"password1234567890123"` → stripped core `"password"`). ≥4 is the floor, not lower: a ≥6 floor still excludes real entries like `"zorro"`, letting `"zorro"` + 15 digits slip through every rule below (confirmed live, and now a regression test); below ≥4, 1–3 character cores (`"i"`, `"the"`, `"car"`) start matching too eagerly, and a passphrase reduced to that short a core already tends to fail the distinct-codepoint rule on its padding anyway.
+
+`generatePassphrase` draws indices from `crypto.getRandomValues` with rejection sampling. `checkPassphrase` runs `normalizePassphrase` first, then applies four rules in order, each with its own `reason`: (1) codepoint length < 20 → reject; (2) the whole passphrase, case-insensitively, is a bundled common password → reject; (3) the passphrase with leading/trailing non-letter characters stripped is, case-insensitively, a bundled common password → reject (catches padding wrapped around a common word); (4) fewer than 8 distinct codepoints → reject (catches padding built from one or two repeated characters, which rule 3 cannot catch). There is no character-set check — do not add one.
 
 - [ ] **Step 4: Run test to verify it passes**
 
