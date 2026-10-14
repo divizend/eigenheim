@@ -1,4 +1,4 @@
-# onefile — design
+# eigenheim — design
 
 **Date:** 2026-10-14
 **Status:** approved design, pending implementation plan
