@@ -33,8 +33,13 @@ export const DICEWARE: readonly string[] = linesOf(dicewareRaw)
 /** A filtered slice of SecLists' `Pwdb_top-10000.txt` (the current
  * equivalent of the "top 10 000 common passwords" list the design spec
  * names -- the originally-named `10-million-password-list-top-10000.txt`
- * no longer exists in that repo): entries of length >=4 only, 9641 of the
- * original 10000.
+ * no longer exists in that repo): entries of length >=4 (9641 of the
+ * original 10000), then deduplicated case-insensitively, keeping
+ * first-seen casing (9448 remain -- 193 lines were pure case variants of an
+ * already-present entry, e.g. "passw0rd" and "Passw0rd", and are dead
+ * bundle weight for a case-INsensitive check: COMMON_PASSWORDS_LOWER below
+ * folds case anyway, so a second casing of the same word can never change
+ * the result of a lookup, only the download size).
  *
  * The plan's original filter was >=20 characters -- the length floor below
  * already rejects anything shorter, so the reasoning went that bundling
@@ -90,20 +95,41 @@ export function normalizePassphrase(p: string): string {
   return p.trim()
 }
 
-/** Draws a uniform random integer in [0, exclusiveMax) from
- * crypto.getRandomValues using rejection sampling -- never modulo on its
- * own, which would silently bias the result whenever exclusiveMax does not
- * evenly divide the random source's range (2^32 is not a multiple of 7776,
- * the diceware list's length). The accepted range below (`limit`) is the
- * largest multiple of exclusiveMax that fits in a Uint32, so every draw
- * that survives rejection maps onto [0, exclusiveMax) with exactly equal
- * probability per index; draws at or above it are redrawn, never folded. */
-function randomIndex(exclusiveMax: number): number {
+/** Draws a uniform random integer in [0, exclusiveMax) using rejection
+ * sampling -- never modulo on its own, which would silently bias the result
+ * whenever exclusiveMax does not evenly divide the random source's range
+ * (2^32 is not a multiple of 7776, the diceware list's length). The
+ * accepted range below (`limit`) is the largest multiple of exclusiveMax
+ * that fits in a Uint32, so every draw that survives rejection maps onto
+ * [0, exclusiveMax) with exactly equal probability per index; draws at or
+ * above it are redrawn, never folded.
+ *
+ * `randomSource` defaults to `crypto.getRandomValues` (production behaviour
+ * is unchanged) but is an injectable parameter, and this function is
+ * exported, specifically so passphrase.test.ts can feed deterministic draws
+ * and prove the rejection *mechanism* -- that an out-of-range draw triggers
+ * a second draw rather than being folded with modulo. A large-sample
+ * coverage test cannot prove that on its own: the bias a naive `draw %
+ * exclusiveMax` introduces here is only ~0.00018% (2560 out of 2^32),
+ * invisible at any sample size a unit test can afford.
+ *
+ * Typed `Uint32Array<ArrayBuffer>`, not the bare `Uint32Array` (which TS's
+ * generic TypedArrays, as of this project's pinned ~6.0.2, default to the
+ * wider `Uint32Array<ArrayBufferLike>` when written with no explicit
+ * generic argument): `crypto.getRandomValues` itself requires the narrower
+ * `ArrayBufferView<ArrayBuffer>`, specifically excluding `SharedArrayBuffer`,
+ * so the bare form fails to typecheck here even though `new Uint32Array(1)`
+ * below (whose constructor overload already returns the `ArrayBuffer`-backed
+ * form) is perfectly fine passed to it directly. */
+export function randomIndex(
+  exclusiveMax: number,
+  randomSource: (buf: Uint32Array<ArrayBuffer>) => void = (buf) => crypto.getRandomValues(buf),
+): number {
   const limit = Math.floor(0x1_0000_0000 / exclusiveMax) * exclusiveMax
   const draw = new Uint32Array(1)
   let value: number
   do {
-    crypto.getRandomValues(draw)
+    randomSource(draw)
     value = draw[0]
   } while (value >= limit)
   return value % exclusiveMax
@@ -130,12 +156,61 @@ export function generatePassphrase(words = 6): string {
  * is what catches a common word with padding bolted on to clear the length
  * floor, e.g. "password1234567890123" -> "password". A string with no
  * letters at all (e.g. all digits, or all emoji) strips down to "", which
- * matches no bundled entry (the shortest is 6 characters). */
+ * matches no bundled entry (the shortest is 4 characters). */
 function stripNonLetterEnds(p: string): string {
   return p.replace(/^[^\p{L}]+/u, "").replace(/[^\p{L}]+$/u, "")
 }
 
-/** The passphrase strength floor (spec §5.5, extended by ruling R11 -- see
+/** Length of the longest run of consecutive codepoints that step by exactly
+ * +1 (ascending, e.g. "abcdef") or exactly -1 (descending, e.g. "654321")
+ * IN ONE CONSISTENT DIRECTION throughout the run -- not just "every step is
+ * +-1". That distinction is the whole point: a detector that accepted
+ * either sign at every step would count alternating patterns like the
+ * "o-n-o-p" inside "monopoly" as a 4-run, which would reject a legitimate
+ * diceware word. A direction reversal breaks the run, though the reversing
+ * pair can still start a fresh 2-codepoint run in the new direction rather
+ * than resetting to zero: in "abcba", the ascending run "abc" (length 3)
+ * breaks at the second "b", but immediately restarts a descending run at
+ * "cb" (not "b" alone), reaching length 3 again at "cba" -- verified by
+ * tracing the implementation below, not just asserted.
+ *
+ * Operates on raw codepoints, not case-folded -- consistent with
+ * {@link checkPassphrase}'s distinct-codepoint rule, and because every
+ * motivating example (digit runs, lowercase-letter runs) is single-case. */
+function longestSequentialRun(codepoints: readonly string[]): number {
+  if (codepoints.length === 0) return 0
+  let longest = 1
+  let runLength = 1
+  let direction: 1 | -1 | 0 = 0
+  for (let i = 1; i < codepoints.length; i++) {
+    const step = codepoints[i].codePointAt(0)! - codepoints[i - 1].codePointAt(0)!
+    if (step === 1 && direction !== -1) {
+      direction = 1
+      runLength += 1
+    } else if (step === -1 && direction !== 1) {
+      direction = -1
+      runLength += 1
+    } else if (step === 1) {
+      // direction just reversed to ascending; this pair alone starts a
+      // fresh run (the symmetric case, step === -1, is the else-if below)
+      direction = 1
+      runLength = 2
+    } else if (step === -1) {
+      direction = -1
+      runLength = 2
+    } else {
+      direction = 0
+      runLength = 1
+    }
+    longest = Math.max(longest, runLength)
+  }
+  return longest
+}
+
+const MIN_SEQUENTIAL_RUN = 6
+
+/** The passphrase strength floor (spec §5.5, extended by ruling R11 and a
+ * follow-up review round -- see
  * `.superpowers/sdd/2026-10-14-eigenheim/progress.md`). Always runs
  * {@link normalizePassphrase} first, so the form judged here can never
  * disagree with the form that gets encrypted. Rejects on the first of these
@@ -153,11 +228,24 @@ function stripNonLetterEnds(p: string): string {
  *      "aaaaaaaaaaaaaaaaaaaaaa"), which rule 3 cannot catch: there is no
  *      letter run to strip it down to, since the whole string is already
  *      one repeated letter
+ *   5. contains a run of >=6 codepoints that is sequential (steps of
+ *      exactly +-1) in one consistent direction -- catches
+ *      "01234567890123456789" and "abcdefghijklmnopqrst", both of which
+ *      clear rules 1-4 (a sequence accumulates 8+ distinct codepoints long
+ *      before 20 characters, so rule 4 alone does not catch it). Measured
+ *      against the bundled diceware list before choosing 6: the longest
+ *      true consistent-direction run in any single word is 4 (one word,
+ *      "overstuff", has "rstu"), and 4 across 50000 sampled 6-word
+ *      generated phrases -- so 6 leaves a 2-codepoint margin over real
+ *      generated output while catching every demonstrated weak case (which
+ *      score 10-20). No repeated-substring rule is needed alongside this
+ *      one: "abcabcabc..." has only 3 distinct codepoints and is already
+ *      caught by rule 4.
  *
  * There is no character-set restriction anywhere here, by design -- full
  * Unicode is accepted (spec §5.5). No rule inspects *which* characters are
- * used, only *how many* there are and *whether* the result matches a
- * known-weak list. */
+ * used, only *how many* there are, *whether* the result matches a
+ * known-weak list, and *how they are ordered*. */
 export function checkPassphrase(p: string): { ok: true } | { ok: false; reason: string } {
   const normalized = normalizePassphrase(p)
   const codepoints = [...normalized]
@@ -191,6 +279,14 @@ export function checkPassphrase(p: string): { ok: true } | { ok: false; reason: 
     return {
       ok: false,
       reason: `This passphrase repeats only ${distinctCodepoints} distinct characters. Use a passphrase with more variety, not one character repeated to reach the length requirement.`,
+    }
+  }
+
+  const sequentialRun = longestSequentialRun(codepoints)
+  if (sequentialRun >= MIN_SEQUENTIAL_RUN) {
+    return {
+      ok: false,
+      reason: `This passphrase contains a run of ${sequentialRun} sequential characters (like "abcdef" or "987654"). Avoid predictable sequences.`,
     }
   }
 
