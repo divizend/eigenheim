@@ -52,6 +52,16 @@ export async function decryptVault(armored: string, passphrase: string): Promise
     // malformed (bad header, corrupted MAC, ...) — only the former should
     // become WrongPassphraseError. Everything else rethrows unchanged, so a
     // corrupted vault is never misreported as "just retype your passphrase".
+    //
+    // The substring below is a known coupling to age-encryption's internal
+    // error text, not its public API — verified against the exact pinned
+    // version (package.json has no `^`, deliberately: a transitive patch
+    // bump must not silently change this string under us). Confirmed by
+    // reading node_modules/age-encryption@0.3.1/dist/index.js directly:
+    // decryptHeaderInternal throws exactly `Error("no identity matched any
+    // of the file's recipients")` and nowhere else. Bumping the pin means
+    // re-reading that source and re-verifying this substring before trusting
+    // the test that covers it.
     if (err instanceof Error && err.message.includes("no identity matched")) {
       throw new WrongPassphraseError(undefined, { cause: err })
     }

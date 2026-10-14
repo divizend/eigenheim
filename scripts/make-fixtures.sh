@@ -64,10 +64,52 @@ case "$os" in
     ;;
 esac
 
+# SHA-256 of each release tarball age v1.3.2 actually publishes, for the
+# platforms this script supports (linux/darwin x amd64/arm64). The age
+# release itself ships no plain checksums file to check these against —
+# each asset instead has a sigsum transparency-log `.proof` file, and fully
+# verifying that is a separate, much more involved mechanism (a signed,
+# logged inclusion proof, not a hash this script can just compare) that
+# this script does not attempt. So this hash *is* the trust anchor, not a
+# formality on top of one: it was derived by downloading
+# https://github.com/FiloSottile/age/releases/download/v1.3.2/<name>
+# directly and hashing it (verified 2026-10-14; the same download this
+# script performs below, repeated once under direct observation). Bumping
+# AGE_VERSION means re-deriving and re-verifying every value here the same
+# way — never copying a hash in from somewhere else unverified.
+age_sha256_for() {
+  case "$1" in
+    linux-amd64) echo "cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10" ;;
+    linux-arm64) echo "6b8dc4333c53a5a57c9e5834e3a48f92605d7154014cd07269ff3327db5d37f4" ;;
+    darwin-amd64) echo "1d1e4bc66e1427edad7739ae7616157de0e79db8b6d2a1497d7d9925fb06a539" ;;
+    darwin-arm64) echo "e2020b073c44f692685a24d6abc378817eb81ffaaf49fd0531ef8565f767f2f5" ;;
+    *) echo "" ;;
+  esac
+}
+
 tarball="age-v${AGE_VERSION}-${os}-${arch}.tar.gz"
 url="https://github.com/FiloSottile/age/releases/download/v${AGE_VERSION}/${tarball}"
 echo "make-fixtures.sh: downloading $url" >&2
 curl -fsSL "$url" -o "$work_dir/$tarball"
+
+expected_sha256="$(age_sha256_for "${os}-${arch}")"
+if [[ -z "$expected_sha256" ]]; then
+  echo "make-fixtures.sh: no pinned SHA-256 for ${os}-${arch} -- add one (freshly derived from the real release, never copied from elsewhere) before trusting this download" >&2
+  exit 1
+fi
+if [[ "$os" == "darwin" ]]; then
+  actual_sha256="$(shasum -a 256 "$work_dir/$tarball" | awk '{print $1}')"
+else
+  actual_sha256="$(sha256sum "$work_dir/$tarball" | awk '{print $1}')"
+fi
+if [[ "$actual_sha256" != "$expected_sha256" ]]; then
+  echo "make-fixtures.sh: SHA-256 mismatch for $tarball -- refusing to run it" >&2
+  echo "  expected: $expected_sha256" >&2
+  echo "  actual:   $actual_sha256" >&2
+  exit 1
+fi
+echo "make-fixtures.sh: SHA-256 verified for $tarball" >&2
+
 tar -xzf "$work_dir/$tarball" -C "$work_dir"
 age_bin="$work_dir/age/age"
 

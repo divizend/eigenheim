@@ -100,7 +100,7 @@ git add -A && git commit -m "feat: scaffold vite project with build-time repo id
 
 **Files:**
 - Create: `src/vault/crypto.ts`, `scripts/make-fixtures.sh`
-- Create: `tests/fixtures/cli-logn17.age`, `tests/fixtures/cli-logn18.age`, `tests/fixtures/PASSPHRASE`
+- Create: `tests/fixtures/cli-auto.age`, `tests/fixtures/CLI_FACTOR`, `tests/fixtures/typage-logn18.age`, `tests/fixtures/PASSPHRASE`
 - Test: `tests/unit/crypto.test.ts`
 
 **Interfaces:**
@@ -128,11 +128,22 @@ test("writes at the configured work factor", async () => {
   expect(headerOf(a)).toMatch(new RegExp(`scrypt \\S+ ${SCRYPT_LOG_N}\\b`))
 })
 
-test("decrypts files written by the real age CLI at a DIFFERENT work factor", async () => {
-  // spec §11 — proves the header's factor is honoured, not assumed
+test("decrypts files written by the real age CLI, and by this library, at a work factor deliberately different from ours", async () => {
+  // spec §11 — proves the header's factor is honoured, not assumed. age v1.3.2
+  // has no work-factor flag (confirmed: `age --help` lists none) — it
+  // auto-selects by timing the host, so a CLI fixture's factor can only be
+  // observed, never chosen. cli-auto.age is the real `age` CLI at whatever
+  // factor it picked (recorded in CLI_FACTOR); typage-logn18.age is written
+  // by this same library at logN=18, deliberately different from
+  // SCRYPT_LOG_N (17), giving deterministic, machine-independent coverage
+  // of the same claim.
   const pass = (await readFixture("PASSPHRASE")).trim()
-  expect(await decryptVault(await readFixture("cli-logn18.age"), pass)).toBe("interop\n")
-  expect(await decryptVault(await readFixture("cli-logn17.age"), pass)).toBe("interop\n")
+  const cliAuto = await readFixture("cli-auto.age")
+  const recordedFactor = (await readFixture("CLI_FACTOR")).trim()
+  expect(headerOf(cliAuto)).toMatch(new RegExp(`scrypt \\S+ ${recordedFactor}\\b`))
+  expect(Number(recordedFactor)).not.toBe(SCRYPT_LOG_N) // fails loudly if some machine's CLI ever picks 17
+  expect(await decryptVault(cliAuto, pass)).toBe("interop\n")
+  expect(await decryptVault(await readFixture("typage-logn18.age"), pass)).toBe("interop\n")
 })
 
 test("a wrong passphrase raises WrongPassphraseError, not a generic failure", async () => {
@@ -159,7 +170,7 @@ test("text containing age armor delimiters survives a round trip", async () => {
 
 - [ ] **Step 2: Generate the fixtures, then run the test to verify it fails**
 
-`scripts/make-fixtures.sh` downloads the official `age` binary (pinned v1.3.2) and writes `cli-logn17.age` and `cli-logn18.age` from the plaintext `interop\n` using `age -p -a`, with the work factor set via `-WORKFACTOR`/repeated runs as that version supports; it writes the passphrase it used to `tests/fixtures/PASSPHRASE`. Fixtures are committed — CI must not need network to run unit tests.
+age v1.3.2 has no work-factor flag at all (`age --help` lists none), so the original instruction here — writing two CLI fixtures at *chosen* work factors via "`-WORKFACTOR`/repeated runs" — is impossible; the Go implementation auto-selects scrypt's logN by timing the host instead. `scripts/make-fixtures.sh` downloads the official `age` binary (pinned v1.3.2, SHA-256-verified against a hash derived from the real release) and writes two fixtures from the plaintext `interop\n` instead: `cli-auto.age`, via the real interactive `age -p -a` at whatever work factor it auto-selects, with that factor recorded in `tests/fixtures/CLI_FACTOR`; and `typage-logn18.age`, written by this project's own `age-encryption` dependency at logN=18, deliberately different from `SCRYPT_LOG_N` (17). It writes the shared passphrase both fixtures use to `tests/fixtures/PASSPHRASE`. Fixtures are committed — CI must not need network to run unit tests.
 
 Run: `bash scripts/make-fixtures.sh && npx vitest run tests/unit/crypto.test.ts`
 Expected: FAIL — `src/vault/crypto.ts` does not exist
