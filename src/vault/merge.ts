@@ -20,13 +20,38 @@ function splitLines(text: string): string[] {
   return text.split(/(?<=\n)/)
 }
 
-// node-diff3's own `.d.mts` types every diff3Merge parameter and return value
-// as `any` -- this is the precise shape its implementation actually produces
-// when given three string arrays (node_modules/node-diff3/src/diff3.mjs):
-// stable/resolved regions accumulate into one `ok` block, and a true conflict
-// becomes its own block carrying each side's own lines. Narrowed here, at the
-// one boundary where the library's looseness enters, rather than letting
-// `any` leak into merge3's own signature.
+/** Picks the line terminator the conflict markers themselves should use:
+ * strict majority CRLF vs. bare LF, counted across all three inputs combined
+ * (a tie -- including the no-CRLF-anywhere and all-inputs-empty cases --
+ * resolves to `"\n"`). The markers are the one piece of the merged text this
+ * module writes itself rather than copying verbatim from an input, so --
+ * unlike content lines, which always keep whatever terminator they already
+ * had -- they need an explicit choice. Defaulting that choice to `"\n"`
+ * unconditionally would hand a Windows/Word user back a document with CRLF
+ * content interleaved with LF-only marker lines: technically mergeable, but
+ * visibly inconsistent line endings in exactly the conflict view they're
+ * asked to read and resolve. */
+function dominantTerminator(...texts: string[]): "\r\n" | "\n" {
+  const count = (re: RegExp) => texts.reduce((n, t) => n + (t.match(re)?.length ?? 0), 0)
+  return count(/\r\n/g) > count(/(?<!\r)\n/g) ? "\r\n" : "\n"
+}
+
+// node-diff3's types are reasonably precise here, not `any`: package.json's
+// `exports.types` points at `src/diff3.d.ts`, and this project's
+// `moduleResolution: "bundler"` resolves through that condition (confirmed:
+// `tsc --listFiles` under this project's own tsconfig.app.json loads
+// node_modules/node-diff3/src/diff3.d.ts, not the untyped dist/diff3.d.mts
+// that a legacy `moduleResolution: "node"` would fall back to instead).
+// `src/diff3.d.ts` declares `diff3Merge<T = string>(a, o, b, options?):
+// MergeRegion<T>[]`, with `MergeRegion<T> = { ok?: T[]; conflict?: { a: T[];
+// aIndex: number; b: T[]; bIndex: number; o: T[]; oIndex: number } }`.
+//
+// The local `Region` type below isn't rescuing the signature from `any` --
+// it exists for a cleaner call site. `MergeRegion` makes `ok`/`conflict` both
+// optional on the *same* object (only one is ever actually populated per
+// region) and carries `aIndex`/`bIndex`/`o`/`oIndex`, which this module never
+// reads. `Region` is a true discriminated union over just the two fields
+// used here, so the `"ok" in region` check below narrows precisely.
 interface ConflictRegion {
   a: string[]
   b: string[]
@@ -43,11 +68,11 @@ type Region = { ok: string[] } | { conflict: ConflictRegion }
  *
  * Built on `diff3Merge`, the library's lower-level region output, rather
  * than its own `merge`/`mergeDiff3` wrappers: this builds the three marker
- * lines directly (with their own explicit `"\n"`, which the library's
- * flattened wrapper output does not carry) instead of needing to pick them
- * back out of a flattened array by matching literal marker text -- which
- * would be ambiguous against vault content that happens to already contain a
- * line that looks like a marker. */
+ * lines directly (with their own explicit, {@link dominantTerminator}-chosen
+ * line ending, which the library's flattened wrapper output does not carry)
+ * instead of needing to pick them back out of a flattened array by matching
+ * literal marker text -- which would be ambiguous against vault content that
+ * happens to already contain a line that looks like a marker. */
 export function merge3(base: string, mine: string, theirs: string): { text: string; conflicted: boolean } {
   // node-diff3's parameter order is (a, o, b) with the ORIGINAL/BASE in the
   // middle, not first -- mapped here as (mine, base, theirs). Verified
@@ -60,6 +85,7 @@ export function merge3(base: string, mine: string, theirs: string): { text: stri
   // typeof is "string" -- passing already-split arrays, as here, makes that
   // option entirely inapplicable rather than merely overridden.
   const regions = diff3Merge(splitLines(mine), splitLines(base), splitLines(theirs)) as Region[]
+  const eol = dominantTerminator(base, mine, theirs)
 
   let conflicted = false
   const parts: string[] = []
@@ -68,7 +94,7 @@ export function merge3(base: string, mine: string, theirs: string): { text: stri
       parts.push(...region.ok)
     } else {
       conflicted = true
-      parts.push("<<<<<<< mine\n", ...region.conflict.a, "=======\n", ...region.conflict.b, ">>>>>>> theirs\n")
+      parts.push(`<<<<<<< mine${eol}`, ...region.conflict.a, `=======${eol}`, ...region.conflict.b, `>>>>>>> theirs${eol}`)
     }
   }
 
