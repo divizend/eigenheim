@@ -109,9 +109,11 @@ export function normalizePassphrase(p: string): string {
  * exported, specifically so passphrase.test.ts can feed deterministic draws
  * and prove the rejection *mechanism* -- that an out-of-range draw triggers
  * a second draw rather than being folded with modulo. A large-sample
- * coverage test cannot prove that on its own: the bias a naive `draw %
- * exclusiveMax` introduces here is only ~0.00018% (2560 out of 2^32),
- * invisible at any sample size a unit test can afford.
+ * coverage test cannot prove that on its own: a naive `draw % exclusiveMax`
+ * over 32-bit draws gives 2560 of the 7776 indices (2^32 mod 7776) one
+ * extra draw out of ~552336 (floor(2^32/7776)) each, only a ~0.00018%
+ * relative gap between the most- and least-likely word's selection
+ * probability -- invisible at any sample size a unit test can afford.
  *
  * Typed `Uint32Array<ArrayBuffer>`, not the bare `Uint32Array` (which TS's
  * generic TypedArrays, as of this project's pinned ~6.0.2, default to the

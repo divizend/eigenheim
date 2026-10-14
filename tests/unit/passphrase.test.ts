@@ -131,13 +131,15 @@ test("strips surrounding whitespace before judging or using it", () => {
 test("every word index in the bundled list is reachable", () => {
   // This proves only reachability (every index can come up across many
   // draws) -- NOT unbiasedness. A naive `draw % 7776` fold over 32-bit
-  // draws would still pass this assertion comfortably: the resulting bias
-  // between the most- and least-likely word is only ~0.00018% (2560 out of
-  // 2^32), invisible at any sample size a unit test can afford. Proving
-  // the mechanism itself does not fold with modulo is what the
-  // deterministic test below does instead; this one is renamed from "uses
-  // rejection sampling, not modulo" because it never actually demonstrated
-  // that, only reachability.
+  // draws would still pass this assertion comfortably: it gives 2560 of
+  // the 7776 indices (2^32 mod 7776) one extra draw out of ~552336
+  // (floor(2^32/7776)) each -- only a ~0.00018% relative gap between the
+  // most- and least-likely word's selection probability, invisible at any
+  // sample size a unit test can afford. Proving the mechanism itself does
+  // not fold with modulo is what the deterministic test below does
+  // instead; this one is renamed from "uses rejection sampling, not
+  // modulo" because it never actually demonstrated that, only
+  // reachability.
   const seen = new Set<string>()
   for (let i = 0; i < 20000; i++) seen.add(generatePassphrase(1))
   expect(seen.size).toBeGreaterThan(DICEWARE.length * 0.9)
@@ -162,6 +164,20 @@ test("rejection sampling redraws on an out-of-range value instead of folding it 
   })
   expect(calls).toBe(2)
   expect(index).toBe(42)
+
+  // The other half of the same property: a first draw that is already in
+  // range must NOT trigger a second draw. Without this, an implementation
+  // that unconditionally draws twice and uses only the second value would
+  // also satisfy the two assertions above -- an unrealistic mutant, not a
+  // live risk, but closing the test's own logic rather than leaving it
+  // open.
+  let singleCalls = 0
+  const singleDrawIndex = randomIndex(7776, (buf) => {
+    buf[0] = 100
+    singleCalls += 1
+  })
+  expect(singleCalls).toBe(1)
+  expect(singleDrawIndex).toBe(100)
 })
 test("each rejection reason names which rule fired, in words a non-technical user can act on", () => {
   const tooShort = checkPassphrase("short")
