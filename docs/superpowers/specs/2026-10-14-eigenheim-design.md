@@ -181,6 +181,38 @@ replace it with anything that is **≥20 characters** and **not in a bundled lis
 of the 10 000 most common passwords**. No scoring library (zxcvbn is ~400 KB —
 unacceptable per §4); the rule is a rule the user can be told in one sentence.
 
+**Passphrases are full Unicode. There is no character-set restriction.**
+Umlauts, CJK, emoji — all accepted. This is not a concession; it is the only
+correct behaviour, and it costs nothing: `age` and `age-encryption` both feed
+the raw UTF-8 bytes of the passphrase to scrypt, so the two agree byte-for-byte
+with no special handling. Confirmed live (§12) with a passphrase mixing German
+umlauts, Japanese and an emoji — written in the browser, decrypted by the
+official CLI.
+
+Three rules follow, and they are the whole of the passphrase handling:
+
+1. **Length is counted in codepoints**, not UTF-16 units or bytes
+   (`[...p].length`), so an emoji counts once and a 20-character Japanese
+   passphrase is not rejected for being "too short" or accepted for being
+   "long enough" by accident.
+2. **Never normalise on write.** The passphrase is encoded UTF-8 and passed
+   through untouched, exactly as `age` does. Normalising would mean a passphrase
+   that opens the vault in this app but fails under `age -d` — breaking the one
+   guarantee §1 rests on.
+3. **Be forgiving on read.** A visually identical passphrase can carry two
+   encodings (`für` is `66c3bc72` in NFC, `6675cc8872` in NFD) depending on the
+   device's input method. Unlock therefore tries the passphrase as typed, then
+   its NFC form, then its NFD form, before reporting failure. Writes always use
+   the form that worked, so CLI parity is preserved. This is a genuine
+   cross-device hazard shared by every passphrase system; it is cheap to absorb
+   here and expensive to discover later.
+
+**Surrounding whitespace is stripped**, at setup and at unlock alike. A
+passphrase pasted from a notes app with a trailing newline is otherwise
+unreproducible by hand in either the app or the CLI — and with no recovery key
+(§2) that is permanent, total loss. The cost is that a passphrase cannot begin
+or end with a space, which is not a cost.
+
 The passphrase must be re-typed to confirm before setup completes. Setup then
 offers a printable sheet carrying the passphrase, the repo name, and the literal
 `age -d vault.age` command. That sheet is backup hygiene for the one secret —
@@ -396,6 +428,8 @@ Each was confirmed live on 2026-10-14 rather than assumed.
 | Inbound interop is real | typage decrypted `age -p -a` output; header read `scrypt <salt> 18` |
 | Unlock cost and memory, measured not estimated | pure JS, this hardware: logN=16 → 64 MiB / 284 ms enc / 227 ms dec; **logN=17 → 128 MiB / 407 ms / 402 ms**; logN=18 → 256 MiB / 802 ms / 886 ms |
 | The chosen non-default work factor stays interoperable | official `age` v1.3.2 CLI decrypted a logN=17 armored file written by typage |
+| **Unicode passphrases need no special handling** | passphrase `schlüsselwort-für-mein-eigenheim-日本語-🔐` (38 codepoints, 49 UTF-8 bytes) encrypted by typage, decrypted by the official CLI — both feed raw UTF-8 to scrypt |
+| Normalisation is a real cross-device hazard, not an age one | `für` is `66c3bc72` (NFC) vs `6675cc8872` (NFD); `normalize("NFC")` reconciles them — hence §5.5's read-side fallback |
 | Stale writes cannot clobber | GitHub docs, `force` parameter, default `false` |
 | Data commits would otherwise trigger builds | Vercel docs: *"Vercel for GitHub will deploy every push by default. This includes pushes and pull requests made to branches."* |
 | The fix for that is valid config | Vercel docs confirm `git.deploymentEnabled` as an object of branch → boolean, default `true` |

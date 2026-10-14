@@ -21,6 +21,7 @@ Every task's requirements implicitly include these. Violating one is a spec chan
 - **`vault.age` is an ASCII-armored age file with a passphrase (scrypt) recipient and nothing else.** Never add a second recipient — it would be a second door (spec §2, §5.1).
 - **Every write to `data` passes `force: false`** (spec §6.4).
 - **The passphrase is never persisted** to IndexedDB, localStorage, sessionStorage, a cookie, or a URL (spec §7).
+- **Passphrases are full Unicode. No character-set restriction, ever.** Encoded UTF-8 and passed through untouched on write — never Unicode-normalised, or the vault would open here and fail under `age -d`. Surrounding whitespace is stripped; nothing else is (spec §5.5).
 - **Nothing is stored until the repo is confirmed `private: true`** (spec §9.1, §13).
 - **Every failure state offers a visible way forward** (spec §13). A thrown error with no UI affordance is an incomplete task.
 
@@ -29,7 +30,7 @@ Every task's requirements implicitly include these. Violating one is a spec chan
 Five input classes the spec implies but does not enumerate, ordered by how likely they are to bite a real person. Each has a test in the task that owns the code.
 
 1. **Windows line endings (CRLF).** Text pasted from Word or a Windows editor round-trips through age unchanged, then `node-diff3` splits on `\n` and leaves `\r` on every line — producing spurious whole-file conflicts and `\r` corruption on merge. Expected: CRLF text round-trips byte-identically, and a CRLF document edited on one side merges cleanly. → Task 5.
-2. **A non-ASCII passphrase silently breaking the escape hatch.** If the app normalises Unicode (NFC/NFKC) and the `age` CLI does not, a passphrase with an umlaut or an emoji decrypts in-app and fails under `age -d` — total loss, with no recovery path by design. Expected: non-ASCII passphrases are rejected at the floor check with an explanation naming the reason. → Task 4.
+2. **A passphrase pasted with surrounding whitespace.** Users paste from a notes app or password manager and bring a trailing newline or space with them. The passphrase is then unreproducible by hand in either the app or the CLI, and with no recovery key that is permanent total loss. Expected: stripped at setup and at unlock alike, so the two can never disagree. → Task 4. (Related, same task: a passphrase that is *visually* the same but differs in Unicode normalisation across devices — handled by a read-side fallback in Task 11, never by restricting the character set.)
 3. **A token pasted with surrounding whitespace, or the wrong kind of token.** Users paste with a trailing newline, or paste a classic `ghp_` token, or paste the token's *name*. Expected: trimmed before use, and a wrong/insufficient token produces a specific message naming what is wrong — never a silent retry loop. → Task 9.
 4. **Two tabs open on the same device.** Both hold the same vault and write the same `draft.age` in the same IndexedDB. Expected: the second tab does not clobber the first tab's newer draft; last-write-wins on identical content is fine, losing keystrokes is not. → Task 6.
 5. **Rapid repeated commits.** Holding ⌘S, or an autosave bug, hits GitHub's secondary rate limits. Expected: `403`/`429` with `Retry-After` is surfaced as "retrying in Ns", backed off, and retried — not reported as a failed save. → Task 8.
@@ -85,7 +86,7 @@ Expected: FAIL — cannot resolve `../../src/config`
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `npx vitest run tests/unit/config.test.ts`
-Expected: PASS, 3 tests
+Expected: PASS, 4 tests
 
 - [ ] **Step 5: Commit**
 
@@ -139,6 +140,17 @@ test("a wrong passphrase raises WrongPassphraseError, not a generic failure", as
   await expect(decryptVault(a, "a-different-long-passphrase")).rejects.toThrow(WrongPassphraseError)
 })
 
+test("a Unicode passphrase round-trips and is NOT normalised", async () => {
+  // spec §5.5. Verified live against the real CLI with this exact passphrase.
+  const p = "schlüsselwort-für-mein-eigenheim-日本語-🔐"
+  expect(await decryptVault(await encryptVault("ok\n", p), p)).toBe("ok\n")
+  // NFC and NFD are different passphrases, by design — normalising on write
+  // would open the vault here but fail under `age -d`.
+  const nfd = p.normalize("NFD")
+  expect(nfd).not.toBe(p)
+  await expect(decryptVault(await encryptVault("ok\n", p), nfd)).rejects.toThrow(WrongPassphraseError)
+})
+
 test("text containing age armor delimiters survives a round trip", async () => {
   const nasty = "-----BEGIN AGE ENCRYPTED FILE-----\nnot really\n-----END AGE ENCRYPTED FILE-----\n"
   expect(await decryptVault(await encryptVault(nasty, "a-sufficiently-long-passphrase"), "a-sufficiently-long-passphrase")).toBe(nasty)
@@ -159,7 +171,7 @@ Wraps `age-encryption`'s `Encrypter`/`Decrypter` and `armor` per spec §5.2. `de
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `npx vitest run tests/unit/crypto.test.ts`
-Expected: PASS, 5 tests
+Expected: PASS, 6 tests
 
 - [ ] **Step 5: Commit**
 
@@ -238,6 +250,7 @@ git add -A && git commit -m "feat: passphrase-wrapped device identity for local 
 - Produces:
   - `generatePassphrase(words?: number): string` — default 6, space-separated
   - `checkPassphrase(p: string): { ok: true } | { ok: false; reason: string }`
+  - `normalizePassphrase(p: string): string` — strips surrounding whitespace, nothing else. Every passphrase entry point calls it; it must NOT apply Unicode normalisation (spec §5.5 rule 2).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -259,12 +272,20 @@ test("rejects anything under 20 characters", () => {       // spec §5.5
 test("rejects a common password even when long enough", () => {
   expect(checkPassphrase("password1234567890123").ok).toBe(false)
 })
-test("rejects non-ASCII, naming the escape hatch as the reason", () => {
-  // Review Focus 2: the app must not normalise where `age -d` would not,
-  // or a passphrase works in-app and fails on the CLI — unrecoverable.
-  const r = checkPassphrase("schlüsselwort-für-mein-haus")
-  expect(r.ok).toBe(false)
-  expect((r as { reason: string }).reason).toMatch(/age|command line|ASCII/i)
+test("accepts full Unicode — umlauts, CJK, emoji", () => {
+  // spec §5.5. There is no character-set restriction: age and age-encryption
+  // both hash the raw UTF-8 bytes, so no special handling is needed.
+  expect(checkPassphrase("schlüsselwort-für-mein-eigenheim-日本語-🔐")).toEqual({ ok: true })
+})
+test("counts length in codepoints, not UTF-16 units or bytes", () => {
+  expect(checkPassphrase("🔐".repeat(20)).ok).toBe(true)    // 20 codepoints, 40 UTF-16 units
+  expect(checkPassphrase("🔐".repeat(19)).ok).toBe(false)
+})
+test("strips surrounding whitespace before judging or using it", () => {
+  // Review Focus 2 — a pasted trailing newline is otherwise unreproducible
+  // by hand, in this app or in the CLI, and there is no recovery key.
+  expect(normalizePassphrase("  my-long-enough-passphrase\n")).toBe("my-long-enough-passphrase")
+  expect(checkPassphrase("  short  ").ok).toBe(false)       // judged on the stripped form
 })
 test("uses rejection sampling, not modulo, over the word list", () => {
   // every index must be reachable; a modulo fold silently biases the tail
@@ -283,12 +304,12 @@ Expected: FAIL — module not found
 
 `diceware.txt` is the EFF long wordlist (7776 words, one per line, the numeric prefixes stripped). `common-passwords.txt` is the top 10 000 list; filter it to entries of ≥20 characters before bundling — shorter ones are already rejected by the length rule, so shipping them is dead weight in a bundle whose size is a security property (spec §4).
 
-`generatePassphrase` draws indices from `crypto.getRandomValues` with rejection sampling. `checkPassphrase` applies, in order: non-ASCII → reject with the CLI reason; length < 20 → reject; membership in the common list → reject.
+`generatePassphrase` draws indices from `crypto.getRandomValues` with rejection sampling. `checkPassphrase` runs `normalizePassphrase` first, then applies: codepoint length < 20 → reject; membership in the common list → reject. There is no character-set check — do not add one.
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `npx vitest run tests/unit/passphrase.test.ts`
-Expected: PASS, 6 tests
+Expected: PASS, 8 tests
 
 - [ ] **Step 5: Commit**
 
@@ -701,6 +722,19 @@ test("a wrong passphrase fails before any network call", async () => {
   await expect(unlock({ passphrase: "wrong-but-long-enough-x", local })).rejects.toThrow(WrongPassphraseError)
   expect(fetchCalls).toEqual([])
 })
+test("opens a vault written in NFC when the passphrase is typed in NFD", async () => {
+  // spec §5.5 rule 3 — the same passphrase, a different device's input method.
+  // Forgiving on read; still byte-exact on write, so `age -d` keeps working.
+  const nfc = "für-mein-eigenheim-passphrase"
+  await seedCachedVault(await encryptVault("hallo\n", nfc))
+  const s = await unlock({ passphrase: nfc.normalize("NFD"), local })
+  expect(s.text).toBe("hallo\n")
+})
+test("the NFC/NFD fallback is tried in sequence, never concurrently", async () => {
+  // the fallback must not reintroduce what Task 11's third test forbids:
+  // three 128 MiB scrypt runs at once would be worse than the original bug
+  expect(peakConcurrentScrypt).toBe(1)
+})
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -712,10 +746,12 @@ Expected: FAIL — module not found
 
 Two branches on whether `getCachedVault()` returns a value, awaiting each stage strictly in sequence. Do not introduce `Promise.all` anywhere in this function; the third test exists to stop exactly that.
 
+Passphrase candidates are tried in order — as typed (after `normalizePassphrase`), then `.normalize("NFC")`, then `.normalize("NFD")`, skipping duplicates — one at a time, awaiting each. The form that succeeded becomes the session's passphrase, so subsequent writes stay byte-identical to what `age -d` expects. Only after all candidates fail is `WrongPassphraseError` raised.
+
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `npx vitest run tests/unit/unlock.test.ts`
-Expected: PASS, 4 tests
+Expected: PASS, 6 tests
 
 - [ ] **Step 5: Commit**
 
