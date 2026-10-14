@@ -15,36 +15,60 @@ import { diff3Merge } from "node-diff3"
  * attached to it -- e.g. `"a\r\nb\n"` -> `["a\r\n", "b\n"]`. A plain
  * `split("\n")` would strand a trailing `"\r"` on every line of CRLF
  * (Windows/Word-pasted) text, producing spurious whole-file conflicts and
- * `"\r"` corruption on merge (Review Focus 1). */
+ * `"\r"` corruption on merge (Review Focus 1). Only the last element of the
+ * result can ever lack a trailing terminator -- every earlier split happens
+ * right after a `"\n"` by construction. */
 function splitLines(text: string): string[] {
   return text.split(/(?<=\n)/)
 }
 
-/** Picks the line terminator the conflict markers themselves should use:
- * strict majority CRLF vs. bare LF, counted across all three inputs combined
- * (a tie -- including the no-CRLF-anywhere and all-inputs-empty cases --
- * resolves to `"\n"`). The markers are the one piece of the merged text this
- * module writes itself rather than copying verbatim from an input, so --
- * unlike content lines, which always keep whatever terminator they already
- * had -- they need an explicit choice. Defaulting that choice to `"\n"`
- * unconditionally would hand a Windows/Word user back a document with CRLF
- * content interleaved with LF-only marker lines: technically mergeable, but
- * visibly inconsistent line endings in exactly the conflict view they're
- * asked to read and resolve. */
-function dominantTerminator(...texts: string[]): "\r\n" | "\n" {
-  const count = (re: RegExp) => texts.reduce((n, t) => n + (t.match(re)?.length ?? 0), 0)
-  return count(/\r\n/g) > count(/(?<!\r)\n/g) ? "\r\n" : "\n"
+/** Counts, among already-split lines, how many end in `"\r\n"` vs. a bare
+ * `"\n"`. A line with no terminator at all (only ever possible as the last
+ * element of a {@link splitLines} result) contributes to neither count,
+ * rather than being forced into one. */
+function countTerminators(lines: string[]): { crlf: number; lf: number } {
+  let crlf = 0
+  let lf = 0
+  for (const line of lines) {
+    if (line.endsWith("\r\n")) crlf++
+    else if (line.endsWith("\n")) lf++
+  }
+  return { crlf, lf }
+}
+
+/** Strict-majority CRLF vs. bare LF from a {@link countTerminators} result.
+ * `undefined` when there's nothing to go on (no terminated lines at all) --
+ * deliberately not defaulted here, so each caller picks its own fallback
+ * rather than this function silently picking one for every caller. */
+function pickTerminator(counts: { crlf: number; lf: number }): "\r\n" | "\n" | undefined {
+  if (counts.crlf === 0 && counts.lf === 0) return undefined
+  return counts.crlf > counts.lf ? "\r\n" : "\n"
+}
+
+/** Appends a conflict-marker line to `parts`, first inserting `eol` if the
+ * content immediately before it doesn't already end in a newline.
+ *
+ * A conflict region's content comes straight from an input, verbatim --
+ * including, possibly, a final line with no trailing terminator at all (the
+ * document's own last line, mid-conflict). Pushing a marker string directly
+ * after that would concatenate the two with nothing in between (e.g.
+ * `"mine" + "======="` reads as one glued line, `mine=======`) -- not a
+ * conflict a person can read, let alone resolve. This is the one place a
+ * terminator is inserted that didn't come from splitting an input or from
+ * the marker's own trailing `eol`. */
+function pushMarker(parts: string[], marker: string, eol: "\r\n" | "\n"): void {
+  if (parts.length > 0 && !parts[parts.length - 1].endsWith("\n")) parts.push(eol)
+  parts.push(marker + eol)
 }
 
 // node-diff3's types are reasonably precise here, not `any`: package.json's
 // `exports.types` points at `src/diff3.d.ts`, and this project's
 // `moduleResolution: "bundler"` resolves through that condition (confirmed:
 // `tsc --listFiles` under this project's own tsconfig.app.json loads
-// node_modules/node-diff3/src/diff3.d.ts, not the untyped dist/diff3.d.mts
-// that a legacy `moduleResolution: "node"` would fall back to instead).
-// `src/diff3.d.ts` declares `diff3Merge<T = string>(a, o, b, options?):
-// MergeRegion<T>[]`, with `MergeRegion<T> = { ok?: T[]; conflict?: { a: T[];
-// aIndex: number; b: T[]; bIndex: number; o: T[]; oIndex: number } }`.
+// node_modules/node-diff3/src/diff3.d.ts). `src/diff3.d.ts` declares
+// `diff3Merge<T = string>(a, o, b, options?): MergeRegion<T>[]`, with
+// `MergeRegion<T> = { ok?: T[]; conflict?: { a: T[]; aIndex: number; b: T[];
+// bIndex: number; o: T[]; oIndex: number } }`.
 //
 // The local `Region` type below isn't rescuing the signature from `any` --
 // it exists for a cleaner call site. `MergeRegion` makes `ok`/`conflict` both
@@ -68,12 +92,17 @@ type Region = { ok: string[] } | { conflict: ConflictRegion }
  *
  * Built on `diff3Merge`, the library's lower-level region output, rather
  * than its own `merge`/`mergeDiff3` wrappers: this builds the three marker
- * lines directly (with their own explicit, {@link dominantTerminator}-chosen
- * line ending, which the library's flattened wrapper output does not carry)
- * instead of needing to pick them back out of a flattened array by matching
- * literal marker text -- which would be ambiguous against vault content that
- * happens to already contain a line that looks like a marker. */
+ * lines directly (with their own explicit, per-region line ending -- see
+ * {@link pickTerminator}/{@link pushMarker} -- which the library's flattened
+ * wrapper output does not carry) instead of needing to pick them back out of
+ * a flattened array by matching literal marker text -- which would be
+ * ambiguous against vault content that happens to already contain a line
+ * that looks like a marker. */
 export function merge3(base: string, mine: string, theirs: string): { text: string; conflicted: boolean } {
+  const mineLines = splitLines(mine)
+  const baseLines = splitLines(base)
+  const theirsLines = splitLines(theirs)
+
   // node-diff3's parameter order is (a, o, b) with the ORIGINAL/BASE in the
   // middle, not first -- mapped here as (mine, base, theirs). Verified
   // empirically, not assumed: swapping to (base, mine, theirs) still passes
@@ -84,8 +113,17 @@ export function merge3(base: string, mine: string, theirs: string): { text: stri
   // which would shred lines on internal whitespace) when an argument's
   // typeof is "string" -- passing already-split arrays, as here, makes that
   // option entirely inapplicable rather than merely overridden.
-  const regions = diff3Merge(splitLines(mine), splitLines(base), splitLines(theirs)) as Region[]
-  const eol = dominantTerminator(base, mine, theirs)
+  const regions = diff3Merge(mineLines, baseLines, theirsLines) as Region[]
+
+  // Fallback for a conflict region whose own lines carry no terminator to
+  // read a convention from at all (e.g. a single-line document with no
+  // trailing newline anywhere) -- the document-wide convention one level up,
+  // defaulting to "\n" if even that comes up empty. Deriving this per
+  // conflict region (below), rather than once for the whole document, matters
+  // for a document that isn't uniformly CRLF or LF throughout: a CRLF
+  // conflict region in an otherwise-LF document still needs CRLF markers, not
+  // the document's own majority.
+  const documentEol = pickTerminator(countTerminators([...mineLines, ...baseLines, ...theirsLines])) ?? "\n"
 
   let conflicted = false
   const parts: string[] = []
@@ -94,12 +132,18 @@ export function merge3(base: string, mine: string, theirs: string): { text: stri
       parts.push(...region.ok)
     } else {
       conflicted = true
-      parts.push(`<<<<<<< mine${eol}`, ...region.conflict.a, `=======${eol}`, ...region.conflict.b, `>>>>>>> theirs${eol}`)
+      const eol = pickTerminator(countTerminators([...region.conflict.a, ...region.conflict.b])) ?? documentEol
+      pushMarker(parts, "<<<<<<< mine", eol)
+      parts.push(...region.conflict.a)
+      pushMarker(parts, "=======", eol)
+      parts.push(...region.conflict.b)
+      pushMarker(parts, ">>>>>>> theirs", eol)
     }
   }
 
   // Every pushed element already carries its own line terminator -- either
-  // from splitLines (content) or appended explicitly above (markers) -- so
-  // the join itself is "", not "\n".
+  // from splitLines (content), appended explicitly by pushMarker (markers,
+  // and the content immediately before one when it lacked one of its own) --
+  // so the join itself is "", not "\n".
   return { text: parts.join(""), conflicted }
 }
