@@ -118,7 +118,27 @@ export class LocalStore {
    * database and both autosave here). The read of the stored `savedAt` and
    * the conditional write happen inside the SAME readwrite transaction.
    *
-   * What this actually rests on is plain atomicity and mutual exclusion:
+   * `d.savedAt` is validated as a finite number before anything else runs
+   * (before the transaction opens, before the comparison, before the
+   * clone). Without this, a non-numeric `savedAt` reaching this method
+   * would make `d.savedAt >= existing.savedAt` simply evaluate to `false`
+   * against any existing draft with a real numeric `savedAt` (confirmed:
+   * `(() => {}) >= 123` is `false`, not a thrown `TypeError`) -- so the
+   * method would resolve normally, having written nothing and thrown
+   * nothing. That is silent data loss (the user's keystrokes dropped with
+   * no error shown), not a safely-rejected bad call, and it is exactly the
+   * failure class the monotonic-write guard below exists to prevent,
+   * arriving by a different door. The other four slot setters
+   * (`putWrappedIdentity`/`putToken`/`putCachedVault`, and `clear`) have no
+   * equivalent risk: none of them gates a write behind a comparison on
+   * caller-supplied data, so there is nothing for a malformed argument to
+   * silently short-circuit -- a bad value there either clones and is
+   * stored as-is (unconditional put, same as a valid value would be) or
+   * fails to clone and rejects loudly (see the DataCloneError tests),
+   * never a silent no-op.
+   *
+   * What the monotonic-write guard itself actually rests on is plain
+   * atomicity and mutual exclusion:
    * every conformant IndexedDB engine guarantees that two transactions
    * with overlapping scope (here, both readwrite on the same object store)
    * never interleave below transaction granularity -- one fully commits
@@ -157,6 +177,9 @@ export class LocalStore {
    * `putDraft`) to fail reliably against this file's real test too, not
    * just the standalone script. */
   async putDraft(d: Draft): Promise<void> {
+    if (!Number.isFinite(d.savedAt)) {
+      throw new Error(`putDraft: savedAt must be a finite number, got ${String(d.savedAt)}`)
+    }
     const db = await this.db()
     const tx = db.transaction(STORE_NAME, "readwrite")
     const store = tx.objectStore(STORE_NAME)

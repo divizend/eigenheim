@@ -9,6 +9,21 @@ async function readFixture(name: string): Promise<string> {
   return readFile(resolve(import.meta.dirname, "../fixtures", name), "utf8")
 }
 
+/** Awaits `promise` and returns whatever it threw, or `undefined` if it
+ * resolved without throwing. Used instead of bare `.rejects.toThrow()` to
+ * assert the actual error's identity (constructor + `name`), not merely
+ * that *some* error occurred -- a bare "it rejected" assertion would also
+ * pass if the rejection started coming from an unrelated cause, which is
+ * the opposite of what a regression test should do. */
+async function catchError(promise: Promise<unknown>): Promise<unknown> {
+  try {
+    await promise
+    return undefined
+  } catch (err) {
+    return err
+  }
+}
+
 /** Opens the same physical database LocalStore uses and returns every
  * [key, value] pair in every one of its object stores -- a raw scan of what
  * actually sits in storage, independent of (and not routed through)
@@ -148,19 +163,52 @@ test("a second tab does not overwrite a newer draft with an older one", async ()
 // non-contrived way to prove a store method actually rejects instead of
 // hanging forever -- which matters because a method that never settled
 // would freeze the editor's autosave with no error.
-test("putDraft rejects rather than hangs when given a non-cloneable value", async () => {
+//
+// Fix round 2: tightened from a bare `.rejects.toThrow()` (which would
+// also pass if the rejection ever started coming from some unrelated
+// cause) to asserting the actual error identity -- a DOMException named
+// "DataCloneError" -- so the test fails loudly if the real behaviour
+// drifts instead of quietly continuing to pass.
+test("putDraft rejects with a DataCloneError, not just any error, when given a non-cloneable value", async () => {
+  // The non-cloneable value goes in `armored`, not `savedAt`: `savedAt`
+  // now has its own dedicated finite-number validation (fix round 2, item
+  // 2 below), which would intercept a non-numeric `savedAt` before the
+  // clone ever runs -- that is a real and separately-tested path, but it
+  // is NOT this test's subject, so `savedAt` here is a plain valid number.
   const store = new LocalStore()
-  await expect(
-    store.putDraft({ armored: "x", baseSha: "y", savedAt: (() => {}) as unknown as number }),
-  ).rejects.toThrow()
+  const caught = await catchError(
+    store.putDraft({ armored: (() => {}) as unknown as string, baseSha: "y", savedAt: 123 }),
+  )
+  expect(caught).toBeInstanceOf(DOMException)
+  expect((caught as DOMException).name).toBe("DataCloneError")
 })
 
-test("putToken also rejects rather than hangs when given a non-cloneable value", async () => {
+test("putToken also rejects with a DataCloneError when given a non-cloneable value", async () => {
   // Same shape against a different setter -- one that takes a bare string
   // rather than an object -- so the coverage is not specific to putDraft's
   // particular argument shape.
   const store = new LocalStore()
-  await expect(store.putToken((() => {}) as unknown as string)).rejects.toThrow()
+  const caught = await catchError(store.putToken((() => {}) as unknown as string))
+  expect(caught).toBeInstanceOf(DOMException)
+  expect((caught as DOMException).name).toBe("DataCloneError")
+})
+
+test("putDraft rejects a non-numeric savedAt instead of silently skipping the write", async () => {
+  // Task 6 review item 2: the guard `!existing || d.savedAt >= existing.savedAt`
+  // is simply `false` when `d.savedAt` is not a number and a draft with a
+  // real numeric savedAt already exists -- so, unvalidated, this would
+  // resolve normally having written nothing and thrown nothing. Silent
+  // data loss: the user's keystrokes dropped with no error shown. This
+  // must reject instead, and must leave the existing draft untouched.
+  const store = new LocalStore()
+  const goodDraft: Draft = { armored: "real-draft", baseSha: "s", savedAt: 123 }
+  await store.putDraft(goodDraft)
+
+  await expect(
+    store.putDraft({ armored: "bad", baseSha: "s", savedAt: (() => {}) as unknown as number }),
+  ).rejects.toThrow(/savedAt/i)
+
+  expect(await store.getDraft()).toEqual(goodDraft)
 })
 
 test("clear() removes every slot", async () => {
