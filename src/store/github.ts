@@ -97,8 +97,16 @@ export class GithubStore {
     this.fetchFn = opts.fetch ?? fetch
   }
 
+  /** `owner`/`repo` come from build-time injection (`repoOwner()`/
+   * `repoSlug()`, spec §9.2), never from user input, so there is no
+   * injection vector being closed here -- GitHub's current repo/owner
+   * naming rules already make a path-breaking character in either
+   * impossible today. Encoded anyway: it is free, it is the standard thing
+   * to do when interpolating a value into a URL path, and it removes an
+   * implicit dependency on those naming rules never changing (or on this
+   * class only ever being constructed with values that respect them). */
   private repoPath(suffix: string): string {
-    return `/repos/${this.owner}/${this.repo}${suffix}`
+    return `/repos/${encodeURIComponent(this.owner)}/${encodeURIComponent(this.repo)}${suffix}`
   }
 
   /** Sends one GitHub API request, with the token and API version header
