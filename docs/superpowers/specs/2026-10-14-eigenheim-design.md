@@ -417,7 +417,9 @@ protection it does not have.
 
 ## 12. Verified facts this design rests on
 
-Each was confirmed live on 2026-10-14 rather than assumed.
+Each was confirmed live rather than assumed — on 2026-10-14, except the
+non-fast-forward status row below, added 2026-10-15 once task 10's own
+integration test could confirm it for real.
 
 | Claim | Evidence |
 |---|---|
@@ -431,16 +433,20 @@ Each was confirmed live on 2026-10-14 rather than assumed.
 | **Unicode passphrases need no special handling** | passphrase `schlüsselwort-für-mein-eigenheim-日本語-🔐` (38 codepoints, 49 UTF-8 bytes) encrypted by typage, decrypted by the official CLI — both feed raw UTF-8 to scrypt |
 | Normalisation is a real cross-device hazard, not an age one | `für` is `66c3bc72` (NFC) vs `6675cc8872` (NFD); `normalize("NFC")` reconciles them — hence §5.5's read-side fallback |
 | Stale writes cannot clobber | GitHub docs, `force` parameter, default `false` |
+| A rejected non-fast-forward `PATCH git/refs` returns **422**, not 409 | Confirmed 2026-10-15 by task 10's own integration test (`tests/integration/github.test.ts`) against three separate real, throwaway private repos in three separate runs, all three returning `422 {"message":"Update is not a fast forward"}` for a second write from the same now-stale `baseSha` — corroborating task 8's own earlier single live reproduction (`src/store/github.ts`'s `write` doc comment). Not proof 409 can *never* occur (GitHub's own docs still list both), but every real reproduction attempted on this project, four in total across two tasks, has returned 422. The client maps both to `StaleWriteError` regardless, so this does not change any code — it only resolves spec §12's own open question. |
 | Data commits would otherwise trigger builds | Vercel docs: *"Vercel for GitHub will deploy every push by default. This includes pushes and pull requests made to branches."* |
 | The fix for that is valid config | Vercel docs confirm `git.deploymentEnabled` as an object of branch → boolean, default `true` |
 
-Two things were deliberately **not** confirmed, and the design is built so that
-neither can break it:
+One thing was deliberately **not** confirmed, and the design is built so that it
+cannot break it:
 
 | Open question | How the design absorbs it |
 |---|---|
 | Whether Vercel's deploy flow lets the user create the repo as private | Not documented anywhere in Vercel's deploy-button or GitHub-integration docs. Irrelevant by construction: §13's visibility guard blocks until the repo is private, whichever way it got there. |
-| Whether a rejected non-fast-forward returns 409 or 422 | GitHub documents both as possible for the endpoint without saying which applies. The client treats both as `StaleWriteError`; an integration test (§11) records the real behaviour. |
+
+(The other open question this table used to list — whether a rejected
+non-fast-forward returns 409 or 422 — is resolved above: confirmed 422,
+2026-10-15.)
 
 ## 13. Error handling — every state has a visible way forward
 
