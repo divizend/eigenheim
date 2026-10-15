@@ -43,12 +43,88 @@ const MAX_RETRY_DELAY_MS = 30_000
  * many seconds has elapsed" -- a plain integer count of seconds, never an HTTP-date. Falls back
  * to capped exponential backoff when the header is absent or unparseable: this task's own brief
  * says Retry-After arrives "often", not always, and a rate-limited response with no header must
- * still back off rather than busy-loop. */
+ * still back off rather than busy-loop.
+ *
+ * `header` is checked for truthiness, not just non-null (fix round 1, review finding 2):
+ * `res.headers.get(...)` returns `null` when the header is absent, but an empty or
+ * whitespace-only *value* is still a non-null string, and `Number("")`/`Number("   ")` are both
+ * `0` -- finite and `>= 0` -- which previously made either case compute a bogus 0ms delay
+ * instead of falling back to exponential backoff. Confirmed live in this project's own Node
+ * runtime before fixing: `Number("")` -> `0`, `Number.isFinite(0)` -> `true`. Not a realistic
+ * GitHub response (GitHub either omits the header or sends a real integer), but the guard is
+ * one extra `?.trim()` and closes the whole class of "present but content-free" values, not
+ * just the literal empty string the review named. */
 function retryDelayMs(res: Response, attempt: number): number {
-  const header = res.headers.get("retry-after")
-  const seconds = header === null ? NaN : Number(header)
+  const header = res.headers.get("retry-after")?.trim()
+  const seconds = header ? Number(header) : NaN
   if (Number.isFinite(seconds) && seconds >= 0) return Math.min(seconds * 1000, MAX_RETRY_DELAY_MS)
   return Math.min(DEFAULT_RETRY_DELAY_MS * 2 ** attempt, MAX_RETRY_DELAY_MS)
+}
+
+/** Does this 403/429 carry a positive, GitHub-documented signal that it is actually a rate
+ * limit, rather than some other reason for the same status code? This distinction matters
+ * because 403 (unlike 429) is GitHub's general "forbidden" status, also used for a fine-grained
+ * PAT or GitHub App token that is syntactically valid and unexpired but lacks the specific
+ * permission an endpoint needs -- precisely the mistake a non-technical user following this
+ * app's one-click token walkthrough will make (wrong permission checkbox, or the wrong
+ * repository in the token's access list). Retrying that for up to
+ * `MAX_RATE_LIMIT_RETRIES * ~30s` and then reporting `RateLimitedError` ("retrying shortly")
+ * would be actively wrong: retrying can never fix a permission problem, and the design already
+ * has a recovery flow for exactly this one (the token walkthrough again, task 9's `ensureSetup`
+ * guard).
+ *
+ * `429` is unconditional: GitHub's REST API docs never describe a `429` for any reason other
+ * than rate limiting (confirmed by reading both docs.github.com/en/rest/using-the-rest-api/
+ * rate-limits-for-the-rest-api, which frames every `429` it mentions as a limit, and
+ * docs.github.com/en/rest/using-the-rest-api/troubleshooting-the-rest-api, whose own named
+ * permission-problem case -- "Resource not accessible by integration" / "Resource not
+ * accessible by personal access token" -- is documented as a `403` only). `403` is gated on
+ * three positive signals, any one of which is sufficient, each sourced from GitHub's own
+ * rate-limit docs rather than assumed:
+ * - `retry-after` header present -- secondary limit ("if the header is present...").
+ * - `x-ratelimit-remaining: 0` -- primary limit, documented explicitly: "If you exceed your
+ *   primary rate limit, you will receive a 403 or 429 response, and the x-ratelimit-remaining
+ *   header will be 0."
+ * - the response body's `message` names a rate limit -- the docs describe this shape only in
+ *   prose ("an error message that indicates that you exceeded a secondary rate limit"), so the
+ *   literal substring check here is corroborated rather than directly quoted: real, independent
+ *   reports across multiple docs.github.com/orgs/community/discussions threads consistently
+ *   show the actual text as e.g. "You have exceeded a secondary rate limit...". The permission
+ *   -problem case's own documented message ("Resource not accessible by...") never contains
+ *   this substring, so the two remain distinguishable by message alone even with no header at
+ *   all.
+ *
+ * What this function could **not** verify live: the exact response this project's own fetch
+ * would get back from a real fine-grained PAT that has repository access but lacks the
+ * `Contents: Read and write` permission. Creating such a token has no REST API at all -- GitHub
+ * fine-grained PAT creation is web-UI-only, gated on an interactive human approval step, which
+ * this box cannot drive -- so this is grounded in GitHub's own official troubleshooting
+ * doc (which names the exact message and the status as 403) plus independent, consistent
+ * real-world corroboration, not a live reproduction the way the base_tree/422 findings in
+ * `write`'s own doc comment were. Flagged here rather than silently presented as equally
+ * verified. */
+async function isRateLimited(res: Response): Promise<boolean> {
+  if (res.status === 429) return true
+  if (res.headers.get("retry-after") !== null) return true
+  if (res.headers.get("x-ratelimit-remaining") === "0") return true
+  return /rate limit/i.test(await bodyMessage(res))
+}
+
+/** Best-effort read of a response body's `message` field, for {@link isRateLimited}'s
+ * message-based signal. Never throws: a non-JSON or shapeless body just means "no message to
+ * check", which is the correct, safe default here -- the two header-based signals above do not
+ * depend on this succeeding, so a parse failure can never hide a real rate limit, only fail to
+ * find the one extra, headerless signal. */
+async function bodyMessage(res: Response): Promise<string> {
+  try {
+    const body: unknown = await res.json()
+    if (body && typeof body === "object" && "message" in body && typeof body.message === "string") {
+      return body.message
+    }
+  } catch {
+    // not JSON, or no string `message` field -- fall through to "no message", see above.
+  }
+  return ""
 }
 
 interface RefResponse {
@@ -170,12 +246,17 @@ export class GithubStore {
    * plain, honestly labelled Error: never silently swallowed, but also never forced into a
    * taxonomy this method doesn't own.
    *
-   * A 403 or 429 is always treated as a GitHub rate limit (spec Review Focus 5) and retried
-   * with backoff, up to {@link MAX_RATE_LIMIT_RETRIES} times, before giving up with
-   * {@link RateLimitedError} -- never retried forever. This runs before `errorFor` is even
-   * consulted: nothing in this class ever needs 403/429 to mean anything else (task 9's
-   * permission-check guard reads a `permissions` field off a 200 response body, not a 403
-   * status, so there is no real conflict to arbitrate here). */
+   * A 429 is always a GitHub rate limit (spec Review Focus 5); a 403 is only treated as one
+   * when {@link isRateLimited} finds a positive signal for it (fix round 1: a 403 is also
+   * GitHub's general "forbidden" status, returned for a token that is valid but lacks the
+   * required repository permission -- retrying that is actively wrong, since no amount of
+   * waiting fixes a permission problem). A real rate limit is retried with backoff, up to
+   * {@link MAX_RATE_LIMIT_RETRIES} times, before giving up with {@link RateLimitedError} --
+   * never retried forever. A 403 that isn't a rate limit throws {@link TokenError} immediately,
+   * with a message naming the permission problem, never retried. This all runs before
+   * `errorFor` is even consulted: nothing in this class ever needs 403/429 to mean anything
+   * else (task 9's permission-check guard reads a `permissions` field off a 200 response body,
+   * not a 403 status, so there is no real conflict to arbitrate here). */
   private async request<T>(
     method: string,
     path: string,
@@ -192,12 +273,24 @@ export class GithubStore {
         body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
       })
 
-      if (res.status === 403 || res.status === 429) {
+      if ((res.status === 403 || res.status === 429) && (await isRateLimited(res))) {
         if (attempt >= MAX_RATE_LIMIT_RETRIES) throw new RateLimitedError()
         const delayMs = retryDelayMs(res, attempt)
         this.onRetry?.({ attempt: attempt + 1, delayMs })
         await this.sleepFn(delayMs)
         continue
+      }
+
+      // A 403 that reached here carries none of isRateLimited's three signals -- fix round 1,
+      // review finding 1. Overwhelmingly, per GitHub's own troubleshooting docs, this is a
+      // fine-grained PAT or GitHub App token with insufficient repository permission, not a
+      // rate limit: retrying it cannot help, and misreporting it as RateLimitedError ("retrying
+      // shortly") would tell the user to wait when waiting can never fix it, instead of routing
+      // them to the token walkthrough the design already specifies for exactly this case.
+      if (res.status === 403) {
+        throw new TokenError(
+          `the GitHub token doesn't have the required repository permission ("Contents: Read and write") -- check the token's permissions and repository access list, or create a new one`,
+        )
       }
 
       if (res.status === 401) throw new TokenError()

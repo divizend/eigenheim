@@ -1,5 +1,5 @@
 import { GithubStore } from "../../src/store/github"
-import { StaleWriteError, RateLimitedError } from "../../src/store/errors"
+import { StaleWriteError, RateLimitedError, TokenError } from "../../src/store/errors"
 import { VAULT_PATH, DATA_BRANCH } from "../../src/config"
 
 const storeOpts = { owner: "o", repo: "r", token: "test-token" }
@@ -266,4 +266,68 @@ test("the delay actually awaited matches what onRetry reports, not a drifted val
   ])
   await store.write(writeOpts)
   expect(sleeps).toEqual([3000])
+})
+
+// Fix round 1 (review finding 1): a 403 is GitHub's general "forbidden" status, not only its
+// rate-limit status -- a syntactically valid, unexpired token that simply lacks the required
+// repository permission (the realistic mistake in this app's own one-click fine-grained-PAT
+// setup) also gets a 403. The tests above all happen to carry a `retry-after` header, so none
+// of them would have caught the original bug (every 403 retried unconditionally, then
+// misreported as RateLimitedError once exhausted). These four pin the three positive signals
+// individually, and the one negative case, against the real production code path.
+
+test("a 403 with x-ratelimit-remaining: 0 (primary rate limit) is retried, not treated as a permission error", async () => {
+  const { store } = storeWith([
+    { status: 403, body: { message: "API rate limit exceeded for user ID 1." }, headers: { "x-ratelimit-remaining": "0" } },
+    { status: 200, body: { ref: `refs/heads/${DATA_BRANCH}`, object: { sha: "commit-sha" } } },
+  ])
+  await expect(store.write(writeOpts)).resolves.toMatchObject({ sha: expect.any(String) })
+})
+
+test("a 403 with a rate-limit-naming message but no headers at all is still retried", async () => {
+  const { store } = storeWith([
+    {
+      status: 403,
+      body: { message: "You have exceeded a secondary rate limit. Please wait a few minutes before you try again." },
+    },
+    { status: 200, body: { ref: `refs/heads/${DATA_BRANCH}`, object: { sha: "commit-sha" } } },
+  ])
+  await expect(store.write(writeOpts)).resolves.toMatchObject({ sha: expect.any(String) })
+})
+
+test("a 403 with none of the rate-limit signals raises TokenError immediately, without retrying", async () => {
+  // The actively-wrong case this fix closes: GitHub's own documented wording for this ("Resource
+  // not accessible by personal access token") never mentions a rate limit, and carries neither
+  // `retry-after` nor `x-ratelimit-remaining: 0`.
+  const { store, calls } = storeWith([{ status: 403, body: { message: "Resource not accessible by personal access token" } }])
+  await expect(store.write(writeOpts)).rejects.toThrow(TokenError)
+  // Exactly one request -- proves this raised immediately rather than merely ending in the
+  // right error after retrying anyway (which a looser "rejects.toThrow" alone wouldn't catch).
+  const refCalls = calls.filter((c) => c.endsWith(`/git/refs/heads/${DATA_BRANCH}`))
+  expect(refCalls.length).toBe(1)
+})
+
+test("a 429 is always treated as a rate limit, even with none of the 403 signals present", async () => {
+  // 429 is unconditional (per the brief's fix and GitHub's own docs, which never document a 429
+  // for any reason other than rate limiting) -- a bare 429 with no header and no recognisable
+  // message must still retry, not raise TokenError the way an equally bare 403 now does.
+  const { store } = storeWith([
+    { status: 429, body: { message: "too many requests" } },
+    { status: 200, body: { ref: `refs/heads/${DATA_BRANCH}`, object: { sha: "commit-sha" } } },
+  ])
+  await expect(store.write(writeOpts)).resolves.toMatchObject({ sha: expect.any(String) })
+})
+
+test("an empty Retry-After header value falls back to exponential backoff, not a 0ms delay", async () => {
+  // Fix round 1, review finding 2: `Number("")` is `0`, which is finite and `>= 0`, so the
+  // delay computation previously used a bogus 0ms wait instead of falling back to exponential
+  // backoff. An empty (but present) `retry-after` still satisfies isRateLimited's
+  // header-presence check -- this test is specifically about what delay gets computed and
+  // awaited once that's already decided, not about whether to retry at all.
+  const { store, sleeps } = storeWith([
+    { status: 403, body: { message: "secondary rate limit" }, headers: { "retry-after": "" } },
+    { status: 200, body: { ref: `refs/heads/${DATA_BRANCH}`, object: { sha: "commit-sha" } } },
+  ])
+  await store.write(writeOpts)
+  expect(sleeps).toEqual([1000]) // DEFAULT_RETRY_DELAY_MS * 2**0 -- the fallback, not 0
 })
