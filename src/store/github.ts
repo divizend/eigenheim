@@ -23,7 +23,7 @@
 // every test in this and later tasks drives this class without network.
 
 import { VAULT_PATH, DATA_BRANCH } from "../config"
-import { TokenError, BranchMissingError, StaleWriteError, RateLimitedError } from "./errors"
+import { TokenError, BranchMissingError, StaleWriteError, RateLimitedError, RepoPublicError } from "./errors"
 
 const API_BASE = "https://api.github.com"
 const API_VERSION = "2022-11-28"
@@ -163,6 +163,16 @@ interface ShaResponse {
   sha: string
 }
 
+/** The one response shape {@link GithubStore.ensureSetup} reads from -- confirmed live against
+ * `GET /repos/{o}/{r}` for two real repos on 2026-10-15 (see that method's own doc comment).
+ * `permissions` is optional in this type because an unauthenticated request omits it entirely;
+ * not relevant in practice here, since every call this class makes is authenticated, but the
+ * type should not claim a guarantee this method doesn't itself provide. */
+interface RepoResponse {
+  private: boolean
+  permissions?: { push?: boolean }
+}
+
 /** Strips the embedded newlines GitHub wraps blob `content` at (confirmed
  * live: api.github.com wraps a blob's base64 content at 60 characters per
  * line, trailing newline at the end) before decoding.
@@ -188,6 +198,46 @@ interface ShaResponse {
 function decodeBase64Blob(content: string): string {
   return atob(content.replace(/\n/g, ""))
 }
+
+/** Classic GitHub tokens this app must refuse, by prefix alone -- confirmed directly from
+ * GitHub's own token-format table (docs.github.com/en/authentication/keeping-your-account-and-
+ * data-secure/about-authentication-to-github, read 2026-10-15): "Personal access token
+ * (classic)" -> `ghp_`, "OAuth access token" -> `gho_`, distinct from "Fine-grained personal
+ * access token" -> `github_pat_` (this regex does not match that: its third character is "i",
+ * never "p" or "o" -- checked directly, not assumed). A classic token is a real, working
+ * credential -- it would often even pass {@link GithubStore.ensureSetup}'s own push-permission
+ * check, since a classic PAT's "repo" scope grants broad, multi-repository access -- which is
+ * exactly why this app rejects it on sight rather than letting it "work": spec §6.7's
+ * one-permission-one-repo model depends on the token being fine-grained, and that can only be
+ * told from the token's own prefix, never from how any API call it makes behaves. `ghu_`/`ghs_`/
+ * `ghr_` (GitHub App user/installation/refresh tokens, same docs page) are deliberately not
+ * covered: nothing in this app's own one-click onboarding (spec §9.3) ever hands a non-technical
+ * user one of those to paste. */
+const CLASSIC_TOKEN_PREFIX = /^gh[po]_/
+
+/** The `data` branch's own plaintext explainer (spec §6.1) -- the one artifact on that branch
+ * meant to be read without this app, this passphrase, or any memory of either. Fixed copy, not
+ * templated: nothing about this particular deployment (owner/repo/build hash) belongs in a file
+ * whose entire purpose is to outlive the app that wrote it. Contains the literal `age -d
+ * vault.age` command (interpolated from {@link VAULT_PATH}, not hand-typed, so it can never
+ * drift from the file it actually names) -- spec §6.1 is explicit that a stranger finding this
+ * repo in ten years, with no memory of this project, needs exactly that sentence. */
+const DATA_BRANCH_README = `# This is an encrypted vault, not application source
+
+\`${VAULT_PATH}\` is a single file, encrypted with age (https://age-encryption.org)
+under one passphrase. There is no account, no recovery email, and no support
+desk -- the passphrase is the only key, and nothing but it can decrypt this file.
+
+To read it, install the age CLI and run:
+
+    age -d ${VAULT_PATH}
+
+age will ask for the passphrase, then print the plaintext.
+
+This branch is intentionally orphaned: it shares no history with the
+application's own source on \`main\`. This file and ${VAULT_PATH} are the
+only two things on it.
+`
 
 export class GithubStore {
   private readonly owner: string
@@ -215,10 +265,23 @@ export class GithubStore {
   }) {
     this.owner = opts.owner
     this.repo = opts.repo
-    this.token = opts.token
+    this.token = GithubStore.normalizeToken(opts.token)
     this.fetchFn = opts.fetch ?? fetch
     this.onRetry = opts.onRetry
     this.sleepFn = opts.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)))
+  }
+
+  /** Strips surrounding whitespace from a pasted token -- Review Focus 3: a token copied out of
+   * a notes app or password manager often brings a trailing newline with it, which (left in)
+   * would either break the `Authorization` header outright or silently send a different, wrong
+   * credential. Trim only: this does NOT also reject a classic-prefixed token -- confirmed
+   * deliberately by this task's own test, which feeds this method a whitespace-wrapped `ghp_...`
+   * value and asserts it comes back merely trimmed, not thrown. The classic-token rejection
+   * lives in {@link ensureSetup} instead (see {@link CLASSIC_TOKEN_PREFIX}), because it must
+   * surface as a rejected Promise from an async call a UI is already awaiting, not as this
+   * constructor throwing synchronously before any such Promise exists. */
+  static normalizeToken(raw: string): string {
+    return raw.trim()
   }
 
   /** `owner`/`repo` come from build-time injection (`repoOwner()`/
@@ -403,6 +466,114 @@ export class GithubStore {
     await this.request<unknown>("PATCH", this.repoPath(`/git/refs/heads/${DATA_BRANCH}`), {
       body: { sha: commit.sha, force: false },
       errorFor: (status) => (status === 409 || status === 422 ? new StaleWriteError() : undefined),
+    })
+    return { sha: commit.sha }
+  }
+
+  /** Decides whether this repo is safe and ready to store a vault in -- spec §13's guard, "the
+   * only thing standing between a non-technical user and world-readable ciphertext" (this
+   * project's own task dispatch, verbatim). No step here ever issues a POST or PATCH, so a
+   * caller can call this repeatedly (e.g. a "re-check" button, spec §13's row for the
+   * public-repo case) with no side effects.
+   *
+   * Checks run in a fixed order, each short-circuiting before any later one: a classic
+   * (non-fine-grained) token is rejected before any network call at all, since that problem is
+   * knowable purely from the token's own shape (see {@link CLASSIC_TOKEN_PREFIX}) and "never a
+   * silent retry loop" means not wasting a doomed-by-design call to find it out. Then, off the
+   * single `GET /repos/{o}/{r}` this method issues: 401 is already handled generically by
+   * {@link request} before this method ever sees a response body; `private !== true` ->
+   * {@link RepoPublicError}; `permissions.push !== true` -> {@link TokenError}. Only once all
+   * three pass does this probe whether the `data` ref exists yet, reporting the result as
+   * `needsDataBranch` rather than throwing {@link BranchMissingError} -- unlike a *read*, "the
+   * branch doesn't exist yet" is the expected, normal state for a brand-new deployment here
+   * (spec §9 step 5), not a failure.
+   *
+   * `private`/`permissions.push` shape confirmed live against two real repos on 2026-10-15, not
+   * assumed from the design spec's prose alone: `gh api repos/github/docs` (a repo this token
+   * can only read) came back `{private: false, permissions: {push: false, pull: true, ...}}`;
+   * `gh api repos/sigalor/eudaimon` (a private repo this token administers) came back
+   * `{private: true, permissions: {push: true, ...}}`. Both confirm the exact field names, and
+   * that `permissions` is populated for an authenticated caller, which is all this method reads. */
+  async ensureSetup(): Promise<{ ready: boolean; needsDataBranch: boolean }> {
+    if (CLASSIC_TOKEN_PREFIX.test(this.token)) {
+      throw new TokenError(
+        `this is a classic GitHub token ("ghp_"/"gho_") -- this app needs a fine-grained personal access token instead, scoped to just this one repository`,
+      )
+    }
+    const repo = await this.request<RepoResponse>("GET", this.repoPath(""))
+    if (repo.private !== true) throw new RepoPublicError()
+    if (repo.permissions?.push !== true) {
+      throw new TokenError(
+        `the token can read this repository but cannot write to it -- check it grants "Contents: Read and write" and is scoped to this repo`,
+      )
+    }
+    const needsDataBranch = !(await this.dataRefExists())
+    return { ready: !needsDataBranch, needsDataBranch }
+  }
+
+  /** Whether the `data` branch's ref exists yet -- the same `GET .../git/ref/heads/{DATA_BRANCH}`
+   * {@link readHead} uses, but stopping at "does it exist", never walking into the tree:
+   * {@link ensureSetup} only needs this one boolean, and a tree-walk would cost two more
+   * requests (commit, tree) to answer a question this task was never asked -- its own test
+   * fixture for "missing" is an empty `refs` list, i.e. the ref itself absent, not a ref pointing
+   * at a tree that happens to lack `vault.age` (that distinct condition is {@link readHead}'s
+   * own concern, surfaced as {@link BranchMissingError} there, not here). */
+  private async dataRefExists(): Promise<boolean> {
+    try {
+      await this.request<RefResponse>("GET", this.repoPath(`/git/ref/heads/${DATA_BRANCH}`), {
+        errorFor: (status) => (status === 404 ? new BranchMissingError() : undefined),
+      })
+      return true
+    } catch (e) {
+      if (e instanceof BranchMissingError) return false
+      throw e
+    }
+  }
+
+  /** Creates the orphan `data` branch (spec §9 step 5, §9.5): a root commit -- no parents, no
+   * inherited tree -- holding exactly two files, `vault.age` and a plaintext `README.md`. Five
+   * requests: two blobs (README first, then the vault), a tree naming both, a commit, then
+   * `POST git/refs` to point a brand-new `refs/heads/{DATA_BRANCH}` at it -- `POST`, not
+   * {@link write}'s `PATCH`, because there is no existing ref to conditionally move yet.
+   *
+   * Deliberately the mirror image of {@link write}'s own tree/commit calls, not a copy of them
+   * -- this task's own dispatch names this as the trap to avoid. `write` passes `base_tree:
+   * baseSha` so its tree *inherits* every sibling path from the branch's current tip (that is
+   * what keeps this very README from being deleted on every later save); this method has no
+   * prior commit to inherit from at all, so it omits `base_tree` entirely and lists both paths
+   * itself. `write` passes `parents: [baseSha]`; this method passes `parents: []` -- GitHub's own
+   * docs for "Create a commit" (docs.github.com/en/rest/git/commits, read directly 2026-10-15):
+   * "The full SHAs of the commits that were the parents of this commit. If omitted or empty, the
+   * commit will be written as a root commit" -- `[]`, not omission, so the resulting commit is
+   * unambiguously a root commit in the request itself, not merely "a commit that happens to have
+   * no parents field".
+   *
+   * The `POST git/refs` shape (`{ref, sha}`, both required) is likewise read directly from
+   * GitHub's own docs (docs.github.com/en/rest/git/refs, 2026-10-15), including the one
+   * documented caveat that does not apply here: "You are unable to create new references for
+   * empty repositories... Empty repositories are repositories without branches" -- not a concern
+   * for this app's repo, which always has `main` already populated by the template's own source
+   * before a user ever reaches this step (spec §9 steps 1-4 precede this one). */
+  async initializeDataBranch(opts: { armored: string }): Promise<{ sha: string }> {
+    const readmeBlob = await this.request<ShaResponse>("POST", this.repoPath("/git/blobs"), {
+      body: { content: DATA_BRANCH_README, encoding: "utf-8" },
+    })
+    const vaultBlob = await this.request<ShaResponse>("POST", this.repoPath("/git/blobs"), {
+      body: { content: opts.armored, encoding: "utf-8" },
+    })
+    const tree = await this.request<ShaResponse>("POST", this.repoPath("/git/trees"), {
+      body: {
+        tree: [
+          { path: "README.md", mode: "100644", type: "blob", sha: readmeBlob.sha },
+          { path: VAULT_PATH, mode: "100644", type: "blob", sha: vaultBlob.sha },
+        ],
+      },
+    })
+    const commit = await this.request<ShaResponse>("POST", this.repoPath("/git/commits"), {
+      body: { message: "Initialize data branch", tree: tree.sha, parents: [] },
+    })
+    await this.request<unknown>("POST", this.repoPath("/git/refs"), {
+      body: { ref: `refs/heads/${DATA_BRANCH}`, sha: commit.sha },
     })
     return { sha: commit.sha }
   }
