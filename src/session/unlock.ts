@@ -28,18 +28,43 @@ import { normalizePassphrase } from "../vault/passphrase"
  * own doc comment. */
 export type Stage = "vault" | "token" | "fetch"
 
-/** What a successful unlock produces: the plaintext, the commit SHA it was read at (so a later
- * write can be a conditional, fast-forward-only push against it, spec §6.4), the GitHub token if
- * one is available locally (`null` if not -- reading never depends on it, only syncing and
- * committing do, spec §5.3/§7), and the device identity (needed to decrypt/encrypt
- * `draft.age`/`token.age` later in the session). Deliberately does not carry the resolved
- * passphrase itself -- it is never persisted anywhere (spec §7); whatever in-memory variable the
- * caller already holds it in is this call's own business, not this module's. */
+/** What a successful unlock produces:
+ *
+ * - `text` -- the vault's plaintext.
+ * - `baseSha` -- the commit SHA it was read at, so a later write can be a conditional,
+ *   fast-forward-only push against it (spec §6.4).
+ * - `token` -- the GitHub token, if one is available locally; `null` if not. Reading never
+ *   depends on it -- only syncing and committing do (spec §5.3/§7).
+ * - `identity` -- the device identity, needed to decrypt/encrypt `draft.age`/`token.age` later
+ *   in the session.
+ * - `passphrase` -- the exact form of the passphrase that actually decrypted the vault:
+ *   whichever of the as-typed/NFC/NFD candidates {@link resolvePassphrase} tried first and
+ *   succeeded (see that function's own doc comment). **Not** necessarily the form the user
+ *   typed this time -- by definition, it is the form the vault's ciphertext was produced under,
+ *   since that is the only form that can ever make a passphrase-protected decrypt succeed.
+ *
+ *   This is why Task 12's `commit` needs it rather than re-deriving it: re-encrypting with the
+ *   as-typed form instead, whenever a fallback candidate had been needed to open the vault in
+ *   the first place, would produce a vault that still opens in this app (unlock retries all
+ *   three forms again) but silently fails under `age -d` for the form the user actually types at
+ *   a real terminal -- breaking spec §1's central promise, on the save path, with no recovery
+ *   key to fall back on. Storing the resolved form here is what keeps that from being possible.
+ *
+ *   Kept in memory only, for the lifetime of this session object, exactly like every other
+ *   in-memory passphrase-adjacent value in this project (spec §7's local-persistence table:
+ *   "Passphrase | none -- memory only, for the session | n/a") -- this field does not introduce
+ *   a new place the passphrase is persisted, it is the same in-memory lifetime the spec already
+ *   describes, now reachable from the one object the rest of the session's code already passes
+ *   around. **Never** write it to `LocalStore` (`putWrappedIdentity`/`putToken`/`putDraft`/
+ *   `putCachedVault` all take ciphertext or non-secret metadata only, never this) -- Task 6's "no
+ *   slot ever holds the passphrase" test (`tests/unit/local.test.ts`) is what would catch a
+ *   regression that tried. */
 export interface Session {
   text: string
   baseSha: string
   token: string | null
   identity: string
+  passphrase: string
 }
 
 /** Builds the list of passphrase forms to try, in order, against one scrypt-protected
@@ -163,7 +188,7 @@ export async function unlock(opts: {
     const identity = await unwrapIdentity(wrappedIdentity, resolved)
     const token = await recoverToken(local, identity)
 
-    return { text, baseSha: cached.sha, token, identity }
+    return { text, baseSha: cached.sha, token, identity, passphrase: resolved }
   }
 
   onStage?.("token")
@@ -184,5 +209,5 @@ export async function unlock(opts: {
   onStage?.("vault")
   const text = await decryptVault(head.armored, resolved)
 
-  return { text, baseSha: head.sha, token, identity }
+  return { text, baseSha: head.sha, token, identity, passphrase: resolved }
 }

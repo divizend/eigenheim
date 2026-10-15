@@ -197,6 +197,7 @@ test("with a cached vault: decrypts the vault FIRST, token after", async () => {
     baseSha: "cached-sha-1",
     token: "gh-token-cached-path",
     identity,
+    passphrase: PASS,
   })
 })
 
@@ -218,6 +219,7 @@ test("on a device's first unlock: token, then fetch, then vault", async () => {
     baseSha: "remote-commit-1",
     token: "gh-token-first-unlock",
     identity,
+    passphrase: PASS,
   })
   expect(calls).toEqual([
     `GET /repos/${OWNER}/${REPO}/git/ref/heads/${DATA_BRANCH}`,
@@ -315,6 +317,29 @@ test("opens a vault written in NFC when the passphrase is typed in NFD", async (
   expect(session.text).toBe("hallo\n")
   expect(session.identity).toBe(identity)
   expect(session.token).toBe("gh-token-nfc")
+})
+
+test("session.passphrase holds the resolved form, not the form typed", async () => {
+  // Coordinator fix (post-report): Task 12's commit(session, ...) re-encrypts using
+  // session.passphrase alone, so it must be whichever form actually decrypted the vault, never
+  // the as-typed input -- storing the as-typed form here would re-encrypt under the WRONG bytes
+  // whenever a fallback candidate was needed to open the vault in the first place, producing a
+  // vault that still opens in this app (unlock retries all three forms again next time) but
+  // silently fails under `age -d` for the form the user actually types at a real terminal --
+  // breaking spec §1's central promise, on the save path, with no recovery key. This is the test
+  // that would catch a future refactor reintroducing that bug (e.g. one that returns
+  // `opts.passphrase` directly instead of threading `resolved` through).
+  const nfc = "für-mein-eigenheim-passphrase"
+  const typed = nfc.normalize("NFD")
+  expect(typed).not.toBe(nfc) // sanity: these really are distinct byte sequences, not a no-op
+  const local = new LocalStore()
+  await seedDeviceAndToken(local, nfc, "gh-token-resolved-form")
+  await local.putCachedVault({ armored: await encryptVault("hallo\n", nfc), sha: "s-resolved-form" })
+
+  const session = await unlock({ passphrase: typed, local, makeStore: makeStoreMustNotBeCalled() })
+
+  expect(session.passphrase).toBe(nfc)
+  expect(session.passphrase).not.toBe(typed)
 })
 
 test("the NFC/NFD fallback is tried in sequence, never concurrently", async () => {
