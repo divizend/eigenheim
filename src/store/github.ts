@@ -23,7 +23,14 @@
 // every test in this and later tasks drives this class without network.
 
 import { VAULT_PATH, DATA_BRANCH } from "../config"
-import { TokenError, BranchMissingError, StaleWriteError, RateLimitedError, RepoPublicError } from "./errors"
+import {
+  TokenError,
+  BranchMissingError,
+  StaleWriteError,
+  RateLimitedError,
+  RepoPublicError,
+  AlreadyInitializedError,
+} from "./errors"
 
 const API_BASE = "https://api.github.com"
 const API_VERSION = "2022-11-28"
@@ -203,8 +210,10 @@ function decodeBase64Blob(content: string): string {
  * GitHub's own token-format table (docs.github.com/en/authentication/keeping-your-account-and-
  * data-secure/about-authentication-to-github, read 2026-10-15): "Personal access token
  * (classic)" -> `ghp_`, "OAuth access token" -> `gho_`, distinct from "Fine-grained personal
- * access token" -> `github_pat_` (this regex does not match that: its third character is "i",
- * never "p" or "o" -- checked directly, not assumed). A classic token is a real, working
+ * access token" -> `github_pat_` (this regex does not match that: its second character is "i",
+ * not the required "h" -- `/^gh[po]_/` fails there, one position before the `[po]` class is
+ * even reached; checked directly with `/^gh[po]_/.test("github_pat_")` === false in this
+ * project's own Node runtime, not assumed). A classic token is a real, working
  * credential -- it would often even pass {@link GithubStore.ensureSetup}'s own push-permission
  * check, since a classic PAT's "repo" scope grants broad, multi-repository access -- which is
  * exactly why this app rejects it on sight rather than letting it "work": spec §6.7's
@@ -414,9 +423,11 @@ export class GithubStore {
 
   /** Writes a new vault revision: a conditional, fast-forward-only push to the `data` branch
    * (spec §6.4) -- the mechanism that guarantees no concurrent edit from a second device is
-   * ever silently lost. Four requests, always in this exact order: blob, tree, commit, ref
-   * update -- nothing else reads the branch first, so `baseSha` (the commit the caller's edit
-   * actually started from) is trusted as given, not re-derived.
+   * ever silently lost. {@link assertRepoWritable} first (fix round 1: this cannot be a save
+   * into a repo that turned out to be public, or a token that lacks write access, even if the
+   * caller never called {@link ensureSetup}), then four requests in this exact order: blob,
+   * tree, commit, ref update -- nothing else reads the branch first, so `baseSha` (the commit
+   * the caller's edit actually started from) is trusted as given, not re-derived.
    *
    * `base_tree: opts.baseSha` on the tree-creation call -- a *commit* sha, not a separately
    * fetched tree sha -- is this method's own key design choice, and it is verified, not
@@ -431,7 +442,7 @@ export class GithubStore {
    * which were a part of the parent commit's tree and were not defined in the tree parameter
    * will be listed as deleted by the new commit" -- i.e. omitting `base_tree` here would make
    * every save silently delete README.md from the branch. Using `baseSha` costs nothing extra:
-   * no fifth request, no dependency on task 9's README-creation code.
+   * no separate tree-fetch request, no dependency on task 9's README-creation code.
    *
    * The blob is sent as `encoding: "utf-8"` with the armored text as-is, not pre-encoded to
    * base64 -- also confirmed live to round-trip byte-identical through GitHub's base64 `GET`
@@ -451,6 +462,7 @@ export class GithubStore {
    * forward"), which confirms 422 occurs but not that 409 cannot -- both stay mapped to
    * {@link StaleWriteError}, exactly as required. */
   async write(opts: { baseSha: string; armored: string; message: string }): Promise<{ sha: string }> {
+    await this.assertRepoWritable()
     const blob = await this.request<ShaResponse>("POST", this.repoPath("/git/blobs"), {
       body: { content: opts.armored, encoding: "utf-8" },
     })
@@ -479,27 +491,50 @@ export class GithubStore {
    * Checks run in a fixed order, each short-circuiting before any later one: a classic
    * (non-fine-grained) token is rejected before any network call at all, since that problem is
    * knowable purely from the token's own shape (see {@link CLASSIC_TOKEN_PREFIX}) and "never a
-   * silent retry loop" means not wasting a doomed-by-design call to find it out. Then, off the
-   * single `GET /repos/{o}/{r}` this method issues: 401 is already handled generically by
-   * {@link request} before this method ever sees a response body; `private !== true` ->
-   * {@link RepoPublicError}; `permissions.push !== true` -> {@link TokenError}. Only once all
-   * three pass does this probe whether the `data` ref exists yet, reporting the result as
-   * `needsDataBranch` rather than throwing {@link BranchMissingError} -- unlike a *read*, "the
-   * branch doesn't exist yet" is the expected, normal state for a brand-new deployment here
-   * (spec §9 step 5), not a failure.
-   *
-   * `private`/`permissions.push` shape confirmed live against two real repos on 2026-10-15, not
-   * assumed from the design spec's prose alone: `gh api repos/github/docs` (a repo this token
-   * can only read) came back `{private: false, permissions: {push: false, pull: true, ...}}`;
-   * `gh api repos/sigalor/eudaimon` (a private repo this token administers) came back
-   * `{private: true, permissions: {push: true, ...}}`. Both confirm the exact field names, and
-   * that `permissions` is populated for an authenticated caller, which is all this method reads. */
+   * silent retry loop" means not wasting a doomed-by-design call to find it out. Then
+   * {@link assertRepoWritable} -- shared with {@link write} and {@link initializeDataBranch}, see
+   * its own doc comment for why this is not just an onboarding-time check -- covers 401 (handled
+   * generically by {@link request} before any response body is seen), `private !== true`, and
+   * `permissions.push !== true`. Only once all of that passes does this probe whether the `data`
+   * ref exists yet, reporting the result as `needsDataBranch` rather than throwing
+   * {@link BranchMissingError} -- unlike a *read*, "the branch doesn't exist yet" is the
+   * expected, normal state for a brand-new deployment here (spec §9 step 5), not a failure. */
   async ensureSetup(): Promise<{ ready: boolean; needsDataBranch: boolean }> {
     if (CLASSIC_TOKEN_PREFIX.test(this.token)) {
       throw new TokenError(
         `this is a classic GitHub token ("ghp_"/"gho_") -- this app needs a fine-grained personal access token instead, scoped to just this one repository`,
       )
     }
+    await this.assertRepoWritable()
+    const needsDataBranch = !(await this.dataRefExists())
+    return { ready: !needsDataBranch, needsDataBranch }
+  }
+
+  /** The shared guard between the user and world-readable ciphertext (spec §13) -- called
+   * unconditionally at the top of every method that can put data on the repo ({@link write},
+   * {@link initializeDataBranch}), not only from {@link ensureSetup}'s own onboarding-time check.
+   * Fix round 1 (review finding, Important): without this, a caller that skips `ensureSetup` --
+   * or any future caller nobody has written yet, e.g. task 13's wizard -- could call `write` or
+   * `initializeDataBranch` directly and silently succeed against a public repo or a token
+   * lacking write access, entirely defeating the one guarantee this task exists to provide.
+   *
+   * `private`/`permissions.push` shape confirmed live against two real repos on 2026-10-15, not
+   * assumed from the design spec's prose alone: `gh api repos/github/docs` (a repo this token
+   * can only read) came back `{private: false, permissions: {push: false, pull: true, ...}}`;
+   * `gh api repos/sigalor/eudaimon` (a private repo this token administers) came back
+   * `{private: true, permissions: {push: true, ...}}`. Both confirm the exact field names, and
+   * that `permissions` is populated for an authenticated caller, which is all this method reads.
+   *
+   * Deliberately NOT memoized on the instance. Considered and rejected: saves are user-initiated,
+   * and GitHub's authenticated primary rate limit is 5000/hour, so one extra
+   * `GET /repos/{o}/{r}` per write is trivial -- while a cached flag would introduce a staleness
+   * question (what invalidates it? a timer? a manual re-check?) that would then need its own
+   * documentation and its own tests, for a cost this low. The uncached version also catches a
+   * real case a cache would miss entirely: a repo flipped from private to public *during* a
+   * session (e.g. by the user, in another tab, on github.com) is caught on the very next write,
+   * not only at the next fresh page load. One GET per write, on purpose -- do not "optimise" this
+   * into a cached flag without re-reading this reasoning first. */
+  private async assertRepoWritable(): Promise<void> {
     const repo = await this.request<RepoResponse>("GET", this.repoPath(""))
     if (repo.private !== true) throw new RepoPublicError()
     if (repo.permissions?.push !== true) {
@@ -507,8 +542,6 @@ export class GithubStore {
         `the token can read this repository but cannot write to it -- check it grants "Contents: Read and write" and is scoped to this repo`,
       )
     }
-    const needsDataBranch = !(await this.dataRefExists())
-    return { ready: !needsDataBranch, needsDataBranch }
   }
 
   /** Whether the `data` branch's ref exists yet -- the same `GET .../git/ref/heads/{DATA_BRANCH}`
@@ -531,10 +564,13 @@ export class GithubStore {
   }
 
   /** Creates the orphan `data` branch (spec §9 step 5, §9.5): a root commit -- no parents, no
-   * inherited tree -- holding exactly two files, `vault.age` and a plaintext `README.md`. Five
-   * requests: two blobs (README first, then the vault), a tree naming both, a commit, then
-   * `POST git/refs` to point a brand-new `refs/heads/{DATA_BRANCH}` at it -- `POST`, not
-   * {@link write}'s `PATCH`, because there is no existing ref to conditionally move yet.
+   * inherited tree -- holding exactly two files, `vault.age` and a plaintext `README.md`.
+   * {@link assertRepoWritable} first (fix round 1: this cannot silently create that commit on a
+   * public repo, or with a token lacking write access, even if the caller never called
+   * {@link ensureSetup}), then five requests: two blobs (README first, then the vault), a tree
+   * naming both, a commit, then `POST git/refs` to point a brand-new
+   * `refs/heads/{DATA_BRANCH}` at it -- `POST`, not {@link write}'s `PATCH`, because there is no
+   * existing ref to conditionally move yet.
    *
    * Deliberately the mirror image of {@link write}'s own tree/commit calls, not a copy of them
    * -- this task's own dispatch names this as the trap to avoid. `write` passes `base_tree:
@@ -553,8 +589,23 @@ export class GithubStore {
    * documented caveat that does not apply here: "You are unable to create new references for
    * empty repositories... Empty repositories are repositories without branches" -- not a concern
    * for this app's repo, which always has `main` already populated by the template's own source
-   * before a user ever reaches this step (spec §9 steps 1-4 precede this one). */
+   * before a user ever reaches this step (spec §9 steps 1-4 precede this one).
+   *
+   * Fix round 1 (review finding, Minor): a `data` branch that already exists is reported as
+   * {@link AlreadyInitializedError}, not left to surface as {@link request}'s generic,
+   * unclassified `Error` the way it did before this fix -- `write`'s own non-fast-forward
+   * rejection gets a named class, so this undocumented-but-real failure mode deserved one too.
+   * GitHub's own status-code table for this endpoint (docs.github.com/en/rest/git/refs, read
+   * 2026-10-15) lists only generic descriptions for both candidates -- `409`: "Conflict",
+   * `422`: "Validation failed, or the endpoint has been spammed" -- neither naming the
+   * already-exists case specifically, so which one GitHub actually returns here is exactly as
+   * undocumented as `write`'s own 409-vs-422 ambiguity (spec §12). Not independently
+   * reproducible read-only: confirming it for real would mean creating a second ref against the
+   * same name, which this task may not do (task 10 owns repo/branch lifecycle, deliberately,
+   * with cleanup) -- so, as with `write`, both stay mapped, which is correct and sufficient
+   * regardless of which one is real. */
   async initializeDataBranch(opts: { armored: string }): Promise<{ sha: string }> {
+    await this.assertRepoWritable()
     const readmeBlob = await this.request<ShaResponse>("POST", this.repoPath("/git/blobs"), {
       body: { content: DATA_BRANCH_README, encoding: "utf-8" },
     })
@@ -574,6 +625,7 @@ export class GithubStore {
     })
     await this.request<unknown>("POST", this.repoPath("/git/refs"), {
       body: { ref: `refs/heads/${DATA_BRANCH}`, sha: commit.sha },
+      errorFor: (status) => (status === 409 || status === 422 ? new AlreadyInitializedError() : undefined),
     })
     return { sha: commit.sha }
   }

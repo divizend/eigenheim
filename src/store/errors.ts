@@ -63,6 +63,26 @@ export class RateLimitedError extends Error {
   }
 }
 
+/** `POST git/refs` for the `data` branch (task 9's orphan-branch init) was rejected because that
+ * ref already exists. Deliberately a distinct class from {@link StaleWriteError}, not a reuse of
+ * it, even though both stem from the same kind of GitHub rejection: `StaleWriteError` means "the
+ * remote moved under you mid-edit", and its UI recovery is the three-way conflict view (spec
+ * §6.5) -- which would be actively wrong here, since initialisation has no base version to merge
+ * against and nothing of the caller's own to lose. The right recovery for this one is simply
+ * "reload, your vault already exists", never a merge prompt. GitHub documents both `409` and
+ * `422` as possible statuses for `POST git/refs` without a description specific to the
+ * already-exists case (same undocumented ambiguity as `write`'s own non-fast-forward rejection,
+ * spec §12); both map here, matching how task 8 handled the identical kind of ambiguity. */
+export class AlreadyInitializedError extends Error {
+  constructor(
+    message = "the data branch already exists — reload instead of creating a new one",
+    options?: ErrorOptions,
+  ) {
+    super(message, options)
+    this.name = "AlreadyInitializedError"
+  }
+}
+
 /** Every error class GithubStore can throw, listed once so Task 19's
  * failure-recovery UI can enumerate them exhaustively instead of
  * hand-maintaining a parallel list in a test, which could silently drift
@@ -75,4 +95,5 @@ export const ALL_ERROR_CLASSES = [
   RepoPublicError,
   BranchMissingError,
   RateLimitedError,
+  AlreadyInitializedError,
 ] as const

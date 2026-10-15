@@ -1,5 +1,5 @@
 import { GithubStore } from "../../src/store/github"
-import { StaleWriteError, RateLimitedError, TokenError } from "../../src/store/errors"
+import { StaleWriteError, RateLimitedError, TokenError, RepoPublicError } from "../../src/store/errors"
 import { VAULT_PATH, DATA_BRANCH } from "../../src/config"
 
 const storeOpts = { owner: "o", repo: "r", token: "test-token" }
@@ -31,14 +31,17 @@ interface RecordedRequest {
   body: unknown
 }
 
-/** `write`'s happy-path fixtures: one 201 per creation call (blobs/trees/commits all answer
- * "Created" on success), then a 200 on the ref update. Shapes -- which fields exist, which
- * status codes -- are taken from this task's own live verification against a real (private,
- * scratch, deleted immediately after) repo on 2026-10-15 (see src/store/github.ts's `write`
- * doc comment), not guessed. Fresh object every call, like github-read.test.ts's
- * baseFixtures(), so tests overriding one key via spread never share mutable state. */
+/** `write`'s happy-path fixtures: a repo-GET (for `assertRepoWritable`'s guard, task 9 fix round
+ * 1 -- `write` now calls it unconditionally at its own top, not only `ensureSetup`), then one
+ * 201 per creation call (blobs/trees/commits all answer "Created" on success), then a 200 on the
+ * ref update. Shapes -- which fields exist, which status codes -- are taken from this task's own
+ * live verification against a real (private, scratch, deleted immediately after) repo on
+ * 2026-10-15 (see src/store/github.ts's `write` doc comment), not guessed. Fresh object every
+ * call, like github-read.test.ts's baseFixtures(), so tests overriding one key via spread never
+ * share mutable state. */
 function writeFixtures(): Record<string, FixtureResponse> {
   return {
+    [`GET ${repoPath("")}`]: { status: 200, body: { private: true, permissions: { push: true } } },
     [`POST ${repoPath("/git/blobs")}`]: { status: 201, body: { sha: "blob-sha" } },
     [`POST ${repoPath("/git/trees")}`]: { status: 201, body: { sha: "tree-sha" } },
     [`POST ${repoPath("/git/commits")}`]: { status: 201, body: { sha: "commit-sha" } },
@@ -136,11 +139,14 @@ function storeWith(
 }
 
 test("write creates blob, tree, commit, then fast-forwards the ref", async () => {
+  // Fix round 1 (task 9): the repo-GET from assertRepoWritable now comes first -- five calls,
+  // not four.
   const calls: string[] = []
   const requests: RecordedRequest[] = []
   const store = new GithubStore({ ...storeOpts, fetch: recordingFetch(calls, requests, writeFixtures()) })
   expect(await store.write(writeOpts)).toEqual({ sha: "commit-sha" })
   expect(calls).toEqual([
+    "GET /repos/o/r",
     "POST /repos/o/r/git/blobs",
     "POST /repos/o/r/git/trees",
     "POST /repos/o/r/git/commits",
@@ -164,7 +170,8 @@ test("the commit's parent is the base the edit was made on", async () => {
   const store = new GithubStore({ ...storeOpts, fetch: recordingFetch(calls, requests, writeFixtures()) })
   await store.write(writeOpts)
   const bodyOf = makeBodyOf(requests)
-  expect(bodyOf(calls[2]).parents).toEqual(["base-sha"])
+  // calls[3], not calls[2] -- fix round 1 shifted every index by one (the new GET is calls[0])
+  expect(bodyOf(calls[3]).parents).toEqual(["base-sha"])
 })
 
 test("a rejected non-fast-forward raises StaleWriteError on 409 AND on 422", async () => {
@@ -197,7 +204,8 @@ test("every call in write sends the token and the API version header", async () 
   const requests: RecordedRequest[] = []
   const store = new GithubStore({ ...storeOpts, fetch: recordingFetch(calls, requests, writeFixtures()) })
   await store.write(writeOpts)
-  expect(requests.length).toBe(4)
+  // 5, not 4 -- fix round 1 added assertRepoWritable's own GET as the first call
+  expect(requests.length).toBe(5)
   for (const r of requests) {
     expect(r.headers.authorization).toBe(`Bearer ${storeOpts.token}`)
     expect(r.headers["x-github-api-version"]).toBe("2022-11-28")
@@ -217,12 +225,32 @@ test("the blob carries the real vault content, and the tree is based on baseSha"
   const store = new GithubStore({ ...storeOpts, fetch: recordingFetch(calls, requests, writeFixtures()) })
   await store.write(writeOpts)
   const bodyOf = makeBodyOf(requests)
-  expect(bodyOf(calls[0])).toEqual({ content: writeOpts.armored, encoding: "utf-8" })
-  expect(bodyOf(calls[1])).toEqual({
+  // calls[1]/[2]/[3], not [0]/[1]/[2] -- fix round 1 shifted every index by one (calls[0] is now
+  // assertRepoWritable's own GET, which carries no JSON body to assert against here)
+  expect(bodyOf(calls[1])).toEqual({ content: writeOpts.armored, encoding: "utf-8" })
+  expect(bodyOf(calls[2])).toEqual({
     base_tree: "base-sha",
     tree: [{ path: VAULT_PATH, mode: "100644", type: "blob", sha: "blob-sha" }],
   })
-  expect(bodyOf(calls[2]).message).toBe(writeOpts.message)
+  expect(bodyOf(calls[3]).message).toBe(writeOpts.message)
+})
+
+// Fix round 1 (task 9 review, Important): the review's own reproduction --
+// `new GithubStore({owner, repo, token}).initializeDataBranch({armored})` succeeding, silently,
+// against a public repo -- applies identically to `write`, which is why the fix put the guard in
+// one shared `assertRepoWritable` called from both. This test closes that exact gap for `write`.
+
+test("write refuses a public repo, even when called directly without ensureSetup first", async () => {
+  const calls: string[] = []
+  const requests: RecordedRequest[] = []
+  const responses: Record<string, FixtureResponse> = {
+    ...writeFixtures(),
+    [`GET ${repoPath("")}`]: { status: 200, body: { private: false, permissions: { push: true } } },
+  }
+  const store = new GithubStore({ ...storeOpts, fetch: recordingFetch(calls, requests, responses) })
+  await expect(store.write(writeOpts)).rejects.toThrow(RepoPublicError)
+  // never got anywhere near writing a blob, let alone updating the ref
+  expect(calls).toEqual([`GET ${repoPath("")}`])
 })
 
 test("a rate limit that never clears eventually raises RateLimitedError, not an infinite retry", async () => {

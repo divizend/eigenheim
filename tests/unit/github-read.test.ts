@@ -5,6 +5,7 @@ import {
   RepoPublicError,
   BranchMissingError,
   RateLimitedError,
+  AlreadyInitializedError,
   ALL_ERROR_CLASSES,
 } from "../../src/store/errors"
 import { VAULT_PATH, DATA_BRANCH } from "../../src/config"
@@ -248,14 +249,24 @@ test("readAt reads the vault at a specific historical commit, without walking th
   ])
 })
 
-test("ALL_ERROR_CLASSES lists exactly the five named error classes, each constructible with no arguments", () => {
+test("ALL_ERROR_CLASSES lists exactly the six named error classes, each constructible with no arguments", () => {
   // Task 7 amendment: Task 19's failure-recovery UI test enumerates this
   // array to prove every error class renders a visible way forward, so a
   // class silently missing here (or a stray duplicate) would silently
   // narrow -- or pad -- that coverage. Sorted before comparing: this array
-  // is "the five classes, as a set", not a promise about declaration
-  // order.
-  const expected = [StaleWriteError, TokenError, RepoPublicError, BranchMissingError, RateLimitedError]
+  // is "the six classes, as a set", not a promise about declaration
+  // order. (Task 9 fix round 1 added AlreadyInitializedError as the sixth --
+  // this is exactly the drift this test exists to catch, and it did: this
+  // test started failing the moment that class was added to
+  // ALL_ERROR_CLASSES but not here, which is how this update was found.)
+  const expected = [
+    StaleWriteError,
+    TokenError,
+    RepoPublicError,
+    BranchMissingError,
+    RateLimitedError,
+    AlreadyInitializedError,
+  ]
   const byName = (a: { name: string }, b: { name: string }) => a.name.localeCompare(b.name)
   expect([...ALL_ERROR_CLASSES].sort(byName)).toEqual([...expected].sort(byName))
 

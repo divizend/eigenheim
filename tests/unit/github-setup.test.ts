@@ -1,5 +1,5 @@
 import { GithubStore } from "../../src/store/github"
-import { TokenError, RepoPublicError } from "../../src/store/errors"
+import { TokenError, RepoPublicError, AlreadyInitializedError } from "../../src/store/errors"
 import { VAULT_PATH, DATA_BRANCH } from "../../src/config"
 
 const baseOpts = { owner: "o", repo: "r", token: "test-token" }
@@ -140,21 +140,34 @@ function storeWithToken(token: string): GithubStore {
   return storeFor({ private: true, token }).store
 }
 
-/** Builds a store wired for `initializeDataBranch()`'s own five calls (two blobs, tree, commit,
- * ref-create) -- deliberately carrying NO repo-GET or ref-GET fixture at all, so an accidental
- * call to either (e.g. if initializeDataBranch ever started probing state it has no business
- * probing) fails loudly via recordingFetch's "no fixture response" throw, the same way
- * github-read.test.ts's `readAt` test omits the ref fixture to catch a mistaken ref call. */
-function storeForInit(): { store: GithubStore; calls: string[]; requests: RecordedRequest[] } {
+/** Builds a store wired for `initializeDataBranch()`'s own six calls (the `assertRepoWritable`
+ * guard's repo GET, two blobs, tree, commit, ref-create) -- deliberately carrying NO ref-GET
+ * fixture (the `data`-ref-existence check, not probed by this method at all), so an accidental
+ * call to it fails loudly via recordingFetch's "no fixture response" throw, the same way
+ * github-read.test.ts's `readAt` test omits the ref fixture to catch a mistaken ref call.
+ *
+ * Fix round 1 (review finding, Important): the repo-GET fixture here is new -- added together
+ * with `assertRepoWritable` itself being called at the top of `initializeDataBranch`. Before
+ * this fix, this helper deliberately carried no repo-GET fixture either, for the same
+ * "accidental call fails loudly" reason -- that guarantee flipped: a *missing* call is now the
+ * bug, not an extra one, since the whole point of the fix is that this method must never skip
+ * this check. Always answers `{private: true, permissions: {push: true}}` (the "allowed to
+ * write" shape) unless a test constructs its own store directly to prove the opposite -- see
+ * "initializeDataBranch refuses a public repo" below.
+ *
+ * `refCreateStatus` (default 201, the happy path) lets the one test that needs it simulate a
+ * duplicate-ref rejection (409/422) without touching the other five fixtures. */
+function storeForInit(refCreateStatus = 201): { store: GithubStore; calls: string[]; requests: RecordedRequest[] } {
   const calls: string[] = []
   const requests: RecordedRequest[] = []
   const responses: Record<string, FixtureResponse> = {
+    [`GET ${repoPath("")}`]: { status: 200, body: { private: true, permissions: { push: true } } },
     [`POST ${repoPath("/git/trees")}`]: { status: 201, body: { sha: "data-tree-sha" } },
     [`POST ${repoPath("/git/commits")}`]: { status: 201, body: { sha: "data-commit-sha" } },
-    [`POST ${repoPath("/git/refs")}`]: {
-      status: 201,
-      body: { ref: `refs/heads/${DATA_BRANCH}`, object: { sha: "data-commit-sha" } },
-    },
+    [`POST ${repoPath("/git/refs")}`]:
+      refCreateStatus === 201
+        ? { status: 201, body: { ref: `refs/heads/${DATA_BRANCH}`, object: { sha: "data-commit-sha" } } }
+        : { status: refCreateStatus, body: { message: "Reference already exists" } },
   }
   const store = new GithubStore({ ...baseOpts, fetch: recordingFetch(calls, requests, responses) })
   return { store, calls, requests }
@@ -253,16 +266,65 @@ test("a gho_-prefixed (OAuth) token is also named as wrong, not only ghp_", asyn
   expect((r as Error).message).toMatch(/fine-grained/i)
 })
 
-test("initializeDataBranch's calls happen in the exact order: two blobs, tree, commit, then the ref", async () => {
+test("initializeDataBranch's calls happen in the exact order: guard check, two blobs, tree, commit, then the ref", async () => {
   // None of the tests above pin the full call COUNT/SEQUENCE -- a stray extra call, or a skipped
   // one, could still leave every individual body assertion above passing for the wrong reason.
+  // Fix round 1: now six calls, not five -- the repo-GET from assertRepoWritable comes first.
   const { store, calls } = storeForInit()
   await store.initializeDataBranch({ armored: ARMORED_FIXTURE })
   expect(calls).toEqual([
+    "GET /repos/o/r",
     "POST /repos/o/r/git/blobs",
     "POST /repos/o/r/git/blobs",
     "POST /repos/o/r/git/trees",
     "POST /repos/o/r/git/commits",
     "POST /repos/o/r/git/refs",
   ])
+})
+
+// Fix round 1 (review): three tests closing the gaps the review found. The first two prove the
+// bypass the review's own example demonstrated (`new GithubStore(...).initializeDataBranch(...)`
+// succeeding against a public repo with no prior `ensureSetup` call) is now closed; the third
+// proves the new `AlreadyInitializedError` mapping.
+
+test("initializeDataBranch refuses a public repo, even when called directly without ensureSetup first", async () => {
+  // This is the exact bypass the review named: nothing before this fix stopped a caller that
+  // never calls ensureSetup from silently writing ciphertext to a public repo.
+  const calls: string[] = []
+  const requests: RecordedRequest[] = []
+  const responses: Record<string, FixtureResponse> = {
+    [`GET ${repoPath("")}`]: { status: 200, body: { private: false, permissions: { push: true } } },
+  }
+  const store = new GithubStore({ ...baseOpts, fetch: recordingFetch(calls, requests, responses) })
+  await expect(store.initializeDataBranch({ armored: ARMORED_FIXTURE })).rejects.toThrow(RepoPublicError)
+  // never got anywhere near creating a blob, let alone the orphan commit
+  expect(calls).toEqual([`GET ${repoPath("")}`])
+})
+
+test("initializeDataBranch refuses a token without push permission, even when called directly", async () => {
+  // The push-permission half of the same bypass -- a public/private-correct repo with a
+  // read-only token must be refused too, not only the public-repo case above.
+  const calls: string[] = []
+  const requests: RecordedRequest[] = []
+  const responses: Record<string, FixtureResponse> = {
+    [`GET ${repoPath("")}`]: { status: 200, body: { private: true, permissions: { push: false } } },
+  }
+  const store = new GithubStore({ ...baseOpts, fetch: recordingFetch(calls, requests, responses) })
+  await expect(store.initializeDataBranch({ armored: ARMORED_FIXTURE })).rejects.toThrow(TokenError)
+  expect(calls).toEqual([`GET ${repoPath("")}`])
+})
+
+test("initializeDataBranch raises AlreadyInitializedError when the data branch already exists, on 409 AND on 422", async () => {
+  // Fix round 1 (review finding, Minor): mirrors write()'s own StaleWriteError mapping for the
+  // identical undocumented 409-vs-422 ambiguity (spec §12) -- GitHub's own status-code table for
+  // this endpoint names only generic descriptions for both ("Conflict" / "Validation failed, or
+  // the endpoint has been spammed"), not one specific to "ref already exists", so which status
+  // GitHub actually returns here could not be established read-only (confirming it for real
+  // would need an actual duplicate ref, which this task may not create -- see the report).
+  // Mapping both is correct and sufficient regardless of which one is real, matching task 8's
+  // own precedent for `write`'s identical kind of ambiguity.
+  for (const status of [409, 422]) {
+    const { store } = storeForInit(status)
+    await expect(store.initializeDataBranch({ armored: ARMORED_FIXTURE })).rejects.toThrow(AlreadyInitializedError)
+  }
 })
