@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises"
 import { resolve } from "node:path"
 import "fake-indexeddb/auto"
-import { LocalStore, DB_NAME, type Draft, type CachedVault } from "../../src/store/local"
+import { LocalStore, DB_NAME, type Draft, type CachedVault, type PendingCommit } from "../../src/store/local"
 import { generateDeviceIdentity, wrapIdentity } from "../../src/vault/identity"
 import { encryptToRecipient } from "../../src/vault/crypto"
 
@@ -73,18 +73,43 @@ test("each slot round-trips and is absent before first write", async () => {
   expect(await store.getToken()).toBeNull()
   expect(await store.getDraft()).toBeNull()
   expect(await store.getCachedVault()).toBeNull()
+  expect(await store.getPendingCommit()).toBeNull()
 
   const draft: Draft = { armored: "draft-armor", baseSha: "base-sha-1", savedAt: 1000 }
   const cached: CachedVault = { armored: "vault-armor", sha: "vault-sha-1" }
+  const pending: PendingCommit = { armored: "pending-armor", baseSha: "base-sha-1", message: "save" }
   await store.putWrappedIdentity("wrapped-identity-armor")
   await store.putToken("token-armor")
   await store.putDraft(draft)
   await store.putCachedVault(cached)
+  await store.putPendingCommit(pending)
 
   expect(await store.getWrappedIdentity()).toBe("wrapped-identity-armor")
   expect(await store.getToken()).toBe("token-armor")
   expect(await store.getDraft()).toEqual(draft)
   expect(await store.getCachedVault()).toEqual(cached)
+  expect(await store.getPendingCommit()).toEqual(pending)
+})
+
+test("clearDraft removes only the draft, clearPendingCommit removes only the queued commit", async () => {
+  // Neither Draft nor PendingCommit has an optional field, so neither can be "cleared" through
+  // its own putter (there is no value meaning "nothing pending") -- these two dedicated
+  // deletes are what src/session/sync.ts relies on instead. Proven side by side, each seeded
+  // alongside the other two untouched slots, so a delete that accidentally reached the wrong
+  // key (or wiped the whole store, like clear() deliberately does) would be caught here.
+  const store = new LocalStore()
+  await store.putWrappedIdentity("wrapped-identity-armor")
+  await store.putDraft({ armored: "draft-armor", baseSha: "s", savedAt: 1 })
+  await store.putPendingCommit({ armored: "pending-armor", baseSha: "s", message: "m" })
+
+  await store.clearDraft()
+  expect(await store.getDraft()).toBeNull()
+  expect(await store.getPendingCommit()).not.toBeNull()
+  expect(await store.getWrappedIdentity()).toBe("wrapped-identity-armor")
+
+  await store.clearPendingCommit()
+  expect(await store.getPendingCommit()).toBeNull()
+  expect(await store.getWrappedIdentity()).toBe("wrapped-identity-armor")
 })
 
 test("no slot ever holds the passphrase", async () => {
@@ -107,6 +132,11 @@ test("no slot ever holds the passphrase", async () => {
   await store.putToken(tokenArmor)
   await store.putDraft({ armored: draftArmor, baseSha: "base-sha-2", savedAt: 1 })
   await store.putCachedVault({ armored: "already-ciphertext-vault-blob", sha: "vault-sha-2" })
+  // Task 12's new slot: a queued offline commit is exactly as ciphertext-only as the other
+  // four, so it gets the same regression guard rather than being left uncovered by this test
+  // just because it was added later.
+  const pendingArmor = await encryptToRecipient("pending commit plaintext, never the passphrase", recipient)
+  await store.putPendingCommit({ armored: pendingArmor, baseSha: "base-sha-2", message: "save" })
 
   const serialized = JSON.stringify(await dumpAll())
   expect(serialized).not.toContain(passphrase)
@@ -217,6 +247,7 @@ test("clear() removes every slot", async () => {
   await store.putToken("token-armor")
   await store.putDraft({ armored: "draft-armor", baseSha: "base-sha-3", savedAt: 1 })
   await store.putCachedVault({ armored: "vault-armor", sha: "vault-sha-3" })
+  await store.putPendingCommit({ armored: "pending-armor", baseSha: "base-sha-3", message: "save" })
 
   await store.clear()
 
@@ -224,4 +255,5 @@ test("clear() removes every slot", async () => {
   expect(await store.getToken()).toBeNull()
   expect(await store.getDraft()).toBeNull()
   expect(await store.getCachedVault()).toBeNull()
+  expect(await store.getPendingCommit()).toBeNull()
 })

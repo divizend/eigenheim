@@ -1,5 +1,5 @@
 // Browser-side persistence for everything eigenheim keeps between sessions
-// (spec §7): one IndexedDB database, one object store, four fixed slot
+// (spec §7): one IndexedDB database, one object store, five fixed slot
 // keys. Every slot holds either ciphertext or non-secret metadata -- never
 // a secret in the clear. The passphrase itself is never written here, or
 // anywhere else: it lives in memory for the session only.
@@ -17,7 +17,7 @@ export const DB_NAME = "eigenheim"
 const DB_VERSION = 1
 const STORE_NAME = "slots"
 
-type SlotKey = "wrappedIdentity" | "token" | "draft" | "cachedVault"
+type SlotKey = "wrappedIdentity" | "token" | "draft" | "cachedVault" | "pendingCommit"
 
 /** The in-progress document plus the commit it was last synced against
  * (`baseSha`), and when it was saved -- `savedAt` is what lets
@@ -36,6 +36,23 @@ export interface Draft {
 export interface CachedVault {
   armored: string
   sha: string
+}
+
+/** A commit attempted while GitHub could not be reached (offline, or any failure this app has
+ * no specific recovery story for), held until the next successful retry -- spec §13's "editing
+ * continues; commit queues and retries on reconnect" (src/session/sync.ts owns deciding when
+ * that is and what to do with the result, including replay). `armored` is already the FINAL
+ * `vault.age` ciphertext for this attempt -- encrypted with the vault passphrase, exactly what
+ * `GithubStore.write`'s own `armored` parameter needs -- never the plaintext and never the
+ * passphrase, consistent with every other slot in this file: nothing here is ever a secret in
+ * the clear. `baseSha`/`message` are the rest of what that same call needs to retry the exact
+ * same attempt unchanged once connectivity returns. This file has no dependency on
+ * src/store/github.ts and shouldn't gain one just for this doc comment -- hence the plain
+ * prose reference instead of a `{@link}`. */
+export interface PendingCommit {
+  armored: string
+  baseSha: string
+  message: string
 }
 
 function openDb(): Promise<IDBDatabase> {
@@ -69,7 +86,8 @@ function transactionDone(tx: IDBTransaction): Promise<void> {
 
 /** The browser-side persistence for everything this app keeps between
  * sessions: a wrapped device identity, a GitHub token, an in-progress
- * draft, and a cached vault -- see the module doc comment above and spec §7.
+ * draft, a cached vault, and a queued offline commit -- see the module doc
+ * comment above and spec §7.
  * One instance per tab; every instance opens the same underlying database,
  * by design -- two tabs on the same device share one IndexedDB (spec review
  * focus 4), which is exactly what {@link putDraft}'s monotonic-write check
@@ -194,12 +212,62 @@ export class LocalStore {
     return this.getSlot<Draft>("draft")
   }
 
+  /** Removes the in-progress draft once it is no longer ahead of the committed vault --
+   * {@link putDraft}'s own counterpart cannot express this, since {@link Draft} has no
+   * optional fields and so no way to `put` "nothing is pending" through that method. Called
+   * only after a commit genuinely reaches GitHub (src/session/sync.ts's `commit` and
+   * `replayPendingCommit`, both on success): from that point {@link getCachedVault} and the
+   * just-committed text agree, so there is no separate local-only state left to track until
+   * the next edit writes a new draft. A plain key delete, not a write of some null-ish
+   * sentinel value through {@link putDraft} -- {@link Draft}'s fields are all required, so a
+   * sentinel would need its own special-cased shape, while deleting the key needs none and
+   * leaves {@link getDraft} correctly reporting `null` (its existing "absent" behaviour, see
+   * `getSlot`) with no new case for it to handle. */
+  async clearDraft(): Promise<void> {
+    const db = await this.db()
+    const tx = db.transaction(STORE_NAME, "readwrite")
+    tx.objectStore(STORE_NAME).delete("draft")
+    await transactionDone(tx)
+  }
+
   async putCachedVault(c: CachedVault): Promise<void> {
     await this.putSlot("cachedVault", c)
   }
 
   async getCachedVault(): Promise<CachedVault | null> {
     return this.getSlot<CachedVault>("cachedVault")
+  }
+
+  /** Queues (or replaces) the one commit attempt waiting on connectivity -- see
+   * {@link PendingCommit}. A single slot, not a list, by design (task brief): every commit
+   * this app ever makes already carries the FULL current text, never a diff, so a second
+   * commit attempted while one is already queued strictly supersedes the first -- there is no
+   * reason to ever replay the older, now-superseded snapshot once a newer one exists. A plain,
+   * unconditional put, unlike {@link putDraft}'s own monotonic-write guard: that guard exists
+   * for two tabs racing to autosave the SAME in-progress document against each other's clock
+   * (Review Focus 4), which is a real, tested concern for drafts but not one this task's brief
+   * raises for the commit queue -- last-write-wins is the correct behaviour here regardless of
+   * which of two racing callers' writes happens to land last, since both are, by construction,
+   * at least as current as whichever the user triggered most recently. */
+  async putPendingCommit(p: PendingCommit): Promise<void> {
+    await this.putSlot("pendingCommit", p)
+  }
+
+  async getPendingCommit(): Promise<PendingCommit | null> {
+    return this.getSlot<PendingCommit>("pendingCommit")
+  }
+
+  /** Removes the queued commit once it no longer needs replaying -- either because it was
+   * just written for real (src/session/sync.ts, on success), or because replaying it
+   * surfaced a genuine conflict there: once shown to the user as a conflict it is "a real
+   * answer, not a transient failure" (this task's own brief) and must never be replayed
+   * verbatim again on a later reconnect -- the user's chosen resolution becomes a brand new,
+   * ordinary commit instead, not a retry of this one. */
+  async clearPendingCommit(): Promise<void> {
+    const db = await this.db()
+    const tx = db.transaction(STORE_NAME, "readwrite")
+    tx.objectStore(STORE_NAME).delete("pendingCommit")
+    await transactionDone(tx)
   }
 
   async clear(): Promise<void> {
