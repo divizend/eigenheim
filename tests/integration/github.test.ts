@@ -67,10 +67,40 @@ interface CreatedRepo {
   repo: string
 }
 
-/** Every repo this run creates, tracked the moment creation succeeds (before the caller does
- * anything else with it) so `afterAll` can sweep all of them unconditionally, independent of
- * whether the test that created one went on to pass, throw, or fail an assertion. */
-const createdRepos: CreatedRepo[] = []
+/** Every repo NAME this run creates, tracked the moment the name is *chosen* -- before the create
+ * request is even issued, let alone its response awaited or parsed -- so `afterAll` can sweep all
+ * of them unconditionally, independent of whether the test that created one went on to pass,
+ * throw, or fail an assertion.
+ *
+ * Fix (review finding, Minor): an earlier version of this file pushed onto this array only after
+ * `res.json()` resolved inside `createThrowawayRepo`, which left a real gap -- a 2xx response
+ * whose body failed to parse (e.g. a truncated read on a flaky connection) meant a real repo
+ * existed on GitHub with no record of it anywhere in this file, in either the per-test `finally`
+ * or this backstop. The fix tracks the chosen name unconditionally, before any network call in
+ * `createThrowawayRepo` happens at all: nothing about the response -- not its status, not its
+ * body -- is needed to know which name was asked for. A name tracked for a repo that, it turns
+ * out, was never actually created (the request itself failed) costs nothing:
+ * `deleteRepoByName` below tolerates a 404 as "already gone". That asymmetry is deliberate -- a
+ * spurious no-op delete attempt is free, a silently leaked private repo in the operator's own
+ * account is exactly what this suite's safety rails call non-negotiable. */
+const createdRepoNames: string[] = []
+
+/** Every repo this suite creates belongs to the same account -- whichever one
+ * `EIGENHEIM_IT_TOKEN` authenticates as -- so this is resolved once, lazily, and cached, rather
+ * than re-derived from each individual creation response's own `owner.login` field. Re-deriving
+ * it per-creation is what let the tracking gap above exist in the first place: tracking was
+ * accidentally coupled to a body parse it never actually needed, since the owner never varies
+ * across repos and the repo NAME is already known before any request is even sent. */
+let cachedOwner: string | undefined
+
+async function resolveOwner(): Promise<string> {
+  if (cachedOwner !== undefined) return cachedOwner
+  const res = await githubApi("GET", "/user")
+  if (!res.ok) throw new Error(`GET /user -> ${res.status} ${await res.text()}`)
+  const body = (await res.json()) as { login: string }
+  cachedOwner = body.login
+  return cachedOwner
+}
 
 /** Plain, direct `fetch` against GitHub's REST API -- deliberately independent of `GithubStore`,
  * which has no whole-repo-lifecycle surface at all (by design: it only ever operates on a repo
@@ -113,10 +143,12 @@ function randomSuffix(): string {
   return crypto.randomUUID().replace(/-/g, "").slice(0, 10)
 }
 
-/** Creates an obviously-throwaway repo (`eigenheim-it-<random>`) and registers it for `afterAll`
- * cleanup *before* returning, so a name is tracked even if the caller throws on its very next
- * line. `auto_init: true` -- not GitHub's own default -- so the repo starts with a real commit on
- * its default branch, matching this app's actual real-world precondition (spec §9 steps 1-4
+/** Creates an obviously-throwaway repo (`eigenheim-it-<random>`). The chosen name is pushed onto
+ * `createdRepoNames` as the very first thing this function does -- before resolving the owner,
+ * before issuing the creation request, before anything that could fail or hang -- so cleanup can
+ * find it regardless of what happens next (see that array's own doc comment for the gap this
+ * closes). `auto_init: true` -- not GitHub's own default -- so the repo starts with a real commit
+ * on its default branch, matching this app's actual real-world precondition (spec §9 steps 1-4
  * always populate `main` from the deploy template before onboarding ever reaches
  * `initializeDataBranch`): GitHub documents `POST git/refs` as refusing to create any ref at all
  * in a repo with zero branches ("Empty repositories are repositories without branches" --
@@ -125,6 +157,8 @@ function randomSuffix(): string {
  * precondition, since the real app never hits it either. */
 async function createThrowawayRepo(opts: { private: boolean }): Promise<CreatedRepo> {
   const name = `eigenheim-it-${randomSuffix()}`
+  createdRepoNames.push(name)
+  const owner = await resolveOwner()
   const res = await githubApi("POST", "/user/repos", {
     name,
     private: opts.private,
@@ -134,20 +168,29 @@ async function createThrowawayRepo(opts: { private: boolean }): Promise<CreatedR
   if (!res.ok) {
     throw new Error(`failed to create throwaway repo "${name}": ${res.status} ${await res.text()}`)
   }
-  const body = (await res.json()) as { owner: { login: string }; name: string }
-  const created: CreatedRepo = { owner: body.owner.login, repo: body.name }
-  createdRepos.push(created)
-  return created
+  // No response body needed: the name is the one just chosen (GitHub has no reason to rename a
+  // request that already satisfies its own naming rules), and the owner came from resolveOwner
+  // above, not from this response -- so creation succeeding is established by `res.ok` alone.
+  return { owner, repo: name }
 }
 
 /** Deletes a repo by its exact name. Tolerates 404 (already gone -- e.g. a test's own `finally`
- * already deleted it before `afterAll`'s backstop sweep reaches the same name) so cleanup is
- * idempotent, never throwing merely because something else already finished the job. */
-async function deleteRepo(created: CreatedRepo): Promise<void> {
-  const res = await githubApi("DELETE", repoPath(created, ""))
+ * already deleted it before `afterAll`'s backstop sweep reaches the same name, or the create
+ * request that supposedly produced it actually failed) so cleanup is idempotent, never throwing
+ * merely because something else already finished the job, or there was never anything to do. */
+async function deleteRepoByName(name: string): Promise<void> {
+  const owner = await resolveOwner()
+  const res = await githubApi("DELETE", `/repos/${owner}/${name}`)
   if (!res.ok && res.status !== 404) {
-    throw new Error(`failed to delete throwaway repo "${created.repo}": ${res.status} ${await res.text()}`)
+    throw new Error(`failed to delete throwaway repo "${name}": ${res.status} ${await res.text()}`)
   }
+}
+
+/** Convenience wrapper for call sites that already hold a `CreatedRepo` (every per-test `finally`
+ * below) -- `afterAll`'s own backstop sweep only ever has bare names (`createdRepoNames`), so it
+ * calls `deleteRepoByName` directly instead. */
+async function deleteRepo(created: CreatedRepo): Promise<void> {
+  await deleteRepoByName(created.repo)
 }
 
 /** Set by the lifecycle test below, read by the status-code test -- the one deliberate piece of
@@ -161,18 +204,19 @@ let observedStaleWriteStatus: number | undefined
 
 afterAll(async () => {
   // Unconditional: runs once after every test in this file finishes, regardless of whether each
-  // one passed, threw, or failed an assertion. Every repo this run created gets an independent
-  // delete attempt (one failing must never stop the others); if any genuinely fails (not a 404 --
-  // already handled inside deleteRepo itself), this throws so a leaked repo is loud, never silent.
-  if (createdRepos.length === 0) return
-  const results = await Promise.allSettled(createdRepos.map(deleteRepo))
+  // one passed, threw, or failed an assertion. Every repo NAME this run ever created gets an
+  // independent delete attempt (one failing must never stop the others); if any genuinely fails
+  // (not a 404 -- already handled inside deleteRepoByName itself), this throws so a leaked repo is
+  // loud, never silent.
+  if (createdRepoNames.length === 0) return
+  const results = await Promise.allSettled(createdRepoNames.map(deleteRepoByName))
   const failures = results
-    .map((r, i) => (r.status === "rejected" ? { created: createdRepos[i], reason: r.reason } : undefined))
-    .filter((x): x is { created: CreatedRepo; reason: unknown } => x !== undefined)
+    .map((r, i) => (r.status === "rejected" ? { name: createdRepoNames[i], reason: r.reason } : undefined))
+    .filter((x): x is { name: string; reason: unknown } => x !== undefined)
   if (failures.length > 0) {
     throw new Error(
       `afterAll cleanup failed for ${failures.length} repo(s): ` +
-        failures.map((f) => `${f.created.owner}/${f.created.repo} (${String(f.reason)})`).join("; "),
+        failures.map((f) => `${f.name} (${String(f.reason)})`).join("; "),
     )
   }
 })
