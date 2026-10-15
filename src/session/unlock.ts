@@ -101,9 +101,12 @@ function passphraseCandidates(typed: string): string[] {
  * can reuse that precise form for every other scrypt-protected decrypt in the same unlock call:
  * `vault.age` and `device.age` are always wrapped under byte-identical passphrase bytes (spec
  * §5.1/§5.3 -- one passphrase, two files, never normalised on write), so once one of them is
- * open, the other never needs its own candidate search. That keeps this unlock's worst case at
- * three sequential scrypt runs total (two ciphertexts * up to two candidates beyond the first,
- * minus whichever one the first ciphertext already resolved), not three per file.
+ * open, the other never needs its own candidate search -- it is decrypted with one direct call
+ * using the already-resolved string. That keeps this unlock's worst case at up to 3 attempts to
+ * resolve the first ciphertext (one per candidate from {@link passphraseCandidates}, when all
+ * three forms are genuinely distinct and the last one tried is the correct one), plus exactly 1
+ * further direct attempt on the second ciphertext -- up to 4 scrypt runs total per unlock call,
+ * never a second full candidate search and never 3 per file.
  *
  * The `for (;;)` shape mirrors src/store/github.ts's own `request`'s retry loop -- deliberately,
  * not by coincidence: it is how this project already spells "loop until the last candidate's
