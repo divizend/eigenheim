@@ -117,7 +117,13 @@ test("a second tab does not overwrite a newer draft with an older one", async ()
   // (read-then-write, one tx) implementation won 200/200 such races; a
   // two-transaction (read in tx1, write in tx2) implementation lost
   // 200/200 -- i.e. this firing pattern is a deterministic discriminator
-  // here, not a coin flip.
+  // here, not a coin flip. That determinism comes from IndexedDB's
+  // transaction atomicity/mutual exclusion (whichever transaction runs
+  // first, the other's read observes it as already-committed) plus this
+  // store's merge rule being commutative (keep the larger savedAt) -- NOT
+  // from any guaranteed creation-order scheduling, which IndexedDB does
+  // not promise. See putDraft's own doc comment in src/store/local.ts for
+  // the full reasoning.
   // Each iteration writes the same two fixed (armored, savedAt) pairs to
   // the same "draft" key, so it is self-contained regardless of what a
   // previous iteration left behind -- no reset needed between them.
@@ -130,6 +136,31 @@ test("a second tab does not overwrite a newer draft with an older one", async ()
     ])
     expect((await a.getDraft())!.armored).toBe("new")
   }
+})
+
+// Task 6 review item 1: "I could not find a way to test it" and "it is not
+// testable" are different claims -- the original report asserted the
+// second while having established only the first. A value that
+// type-checks solely via a cast through `unknown` but is not
+// structured-cloneable (a function) goes straight through the existing
+// public setters, with no test-only hook needed, and IndexedDB itself
+// rejects the write with a DataCloneError. This is the real,
+// non-contrived way to prove a store method actually rejects instead of
+// hanging forever -- which matters because a method that never settled
+// would freeze the editor's autosave with no error.
+test("putDraft rejects rather than hangs when given a non-cloneable value", async () => {
+  const store = new LocalStore()
+  await expect(
+    store.putDraft({ armored: "x", baseSha: "y", savedAt: (() => {}) as unknown as number }),
+  ).rejects.toThrow()
+})
+
+test("putToken also rejects rather than hangs when given a non-cloneable value", async () => {
+  // Same shape against a different setter -- one that takes a bare string
+  // rather than an object -- so the coverage is not specific to putDraft's
+  // particular argument shape.
+  const store = new LocalStore()
+  await expect(store.putToken((() => {}) as unknown as string)).rejects.toThrow()
 })
 
 test("clear() removes every slot", async () => {

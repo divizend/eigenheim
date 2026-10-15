@@ -116,24 +116,46 @@ export class LocalStore {
   /** Writes a draft, but never lets an older write clobber a newer one
    * already on disk (spec review focus 4: two tabs on one device share this
    * database and both autosave here). The read of the stored `savedAt` and
-   * the conditional write must happen inside the SAME readwrite
-   * transaction: IndexedDB serializes overlapping-scope transactions in the
-   * order they were created, so a second call's read-inside-its-own-
-   * transaction is guaranteed to observe a first call's already-committed
-   * write before deciding. Splitting the read into its own transaction
-   * (read in tx1, decide in JS, write in tx2) reopens exactly the race this
-   * exists to prevent -- two concurrent calls could each read "nothing
-   * newer yet" before either has written, and then both proceed to write,
-   * leaving the outcome to whichever write transaction happens to commit
-   * last. Verified empirically (not just reasoned about), via a standalone
-   * script against this project's exact fake-indexeddb version, firing two
+   * the conditional write happen inside the SAME readwrite transaction.
+   *
+   * What this actually rests on is plain atomicity and mutual exclusion:
+   * every conformant IndexedDB engine guarantees that two transactions
+   * with overlapping scope (here, both readwrite on the same object store)
+   * never interleave below transaction granularity -- one fully commits
+   * (or aborts) before the other's requests begin executing. So whichever
+   * of two concurrent putDraft calls happens to execute first, the other's
+   * read -- inside its own transaction -- is guaranteed to observe that
+   * already-committed result before deciding.
+   *
+   * This is deliberately NOT a claim that IndexedDB schedules overlapping
+   * transactions in creation order -- it makes no such promise, and
+   * nothing here controls or observes which of two independently-opened
+   * connections "goes first". What actually makes the result
+   * order-independent is that the merge rule itself -- keep the larger
+   * `savedAt`, ties go to whichever write applies second -- is
+   * commutative: swapping which of the two transactions happens to run
+   * first still yields the same max(savedAt) outcome (an exact tie only
+   * changes which value wins, a case the strictly-different savedAt
+   * values in the test below never exercises). A future change to a
+   * non-commutative merge rule would need an actual ordering guarantee
+   * this method does not currently have.
+   *
+   * Splitting the read into its own transaction (read in tx1, decide in
+   * JS, write in tx2) reopens exactly the race this exists to prevent: two
+   * concurrent calls could each read "nothing newer yet" before either has
+   * committed, and both would then proceed to write -- leaving the final
+   * state to whichever write transaction happens to commit last, with no
+   * interleaved read left for the commutative merge rule to rescue.
+   * Verified empirically (not just reasoned about): a standalone script
+   * against this project's exact fake-indexeddb version, firing two
    * concurrent calls (no await between them, joined with Promise.all) 200
-   * times each: a two-transaction implementation picked the older write
-   * 200/200 times; this single-transaction version picked the newer write
-   * 200/200 times. tests/unit/local.test.ts's own race test uses the same
-   * no-await-then-Promise.all firing pattern, repeated 10x per run, and was
-   * separately confirmed (by temporarily swapping in a two-transaction
-   * `putDraft`) to fail reliably against that version too. */
+   * times each, found this single-transaction version picked the newer
+   * write 200/200 times, while a two-transaction variant picked the older
+   * write 200/200 times. tests/unit/local.test.ts's own race test uses the
+   * same firing pattern, repeated 10x per run, and was separately
+   * confirmed (by temporarily swapping in that same two-transaction
+   * `putDraft`) to fail reliably against this file's real test too, not
+   * just the standalone script. */
   async putDraft(d: Draft): Promise<void> {
     const db = await this.db()
     const tx = db.transaction(STORE_NAME, "readwrite")
