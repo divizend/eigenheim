@@ -15,16 +15,13 @@
 
 import { Encrypter, Decrypter, armor } from "age-encryption"
 import { SCRYPT_LOG_N } from "../config"
+import { WrongPassphraseError } from "../store/errors"
 
-/** Thrown by {@link decryptVault} when the supplied passphrase does not open
- * the vault — as opposed to the armored input being malformed, which
- * rethrows the underlying error unchanged (see decryptVault below). */
-export class WrongPassphraseError extends Error {
-  constructor(message = "wrong passphrase", options?: ErrorOptions) {
-    super(message, options)
-    this.name = "WrongPassphraseError"
-  }
-}
+/** Re-exported, not defined here: the class itself lives in src/store/errors.ts so that
+ * `ALL_ERROR_CLASSES` can enumerate it (ruling R26a) without that file acquiring an import.
+ * Every existing `import { WrongPassphraseError } from "../vault/crypto"` keeps working and
+ * keeps referring to the same class, so `instanceof` is unaffected. */
+export { WrongPassphraseError } from "../store/errors"
 
 /** Encrypts `plaintext` to a passphrase-only age file, ASCII-armored so the
  * result is copy-pasteable straight into `age -d` (spec §5.2). Always

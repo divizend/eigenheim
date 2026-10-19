@@ -156,7 +156,27 @@ export class ReplayRepeatedlyUnreachableError extends Error {
  * round 2 extended the scope of what "exhaustively" needs to cover past GithubStore alone).
  * Each constructor is callable with zero arguments (see the defaults above), which is exactly
  * what that test needs in order to instantiate one of each. */
+/** Thrown when a supplied passphrase does not open an age file — as opposed to the armored
+ * input being malformed, which rethrows the underlying error unchanged (see
+ * src/vault/crypto.ts's `decryptVault`).
+ *
+ * MOVED here from src/vault/crypto.ts for ruling R26a, which required it to appear in
+ * {@link ALL_ERROR_CLASSES} so task 19's exhaustive test proves it has a recovery affordance.
+ * Moving it rather than importing it is what preserves this file's one structural property: it
+ * has ZERO imports and must stay a leaf, because every module that throws one of these already
+ * imports FROM here, so an import in the other direction would be a genuine cycle.
+ * src/vault/crypto.ts re-exports it, so every existing `from "../vault/crypto"` import still
+ * resolves to this same class — `grep -rn 'WrongPassphraseError' src/ tests/` was used to
+ * confirm every consumer before the move. */
+export class WrongPassphraseError extends Error {
+  constructor(message = "wrong passphrase", options?: ErrorOptions) {
+    super(message, options)
+    this.name = "WrongPassphraseError"
+  }
+}
+
 export const ALL_ERROR_CLASSES = [
+  WrongPassphraseError,
   StaleWriteError,
   TokenError,
   RepoPublicError,

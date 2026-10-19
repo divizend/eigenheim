@@ -718,3 +718,64 @@
   color: var(--text-h);
   cursor: pointer;
 }
+
+/* ---------------------------------------------------------------------------------------------
+   Failure view (src/ui/errors.ts). Spec §13: no state may dead-end, so the actions are the
+   point of the screen and are given more weight than the apology.
+   --------------------------------------------------------------------------------------------- */
+
+.failure {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 64px 24px;
+  text-align: left;
+}
+
+.failure h1 {
+  font-family: var(--heading);
+  color: var(--text-h);
+  margin: 0 0 12px;
+}
+
+.failure p {
+  color: var(--text);
+  line-height: 1.6;
+}
+
+.failure-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 24px 0;
+}
+
+.failure-actions button,
+.failure-actions a {
+  font-family: var(--sans);
+  font-size: 14px;
+  padding: 8px 16px;
+  border-radius: 6px;
+  border: 2px solid var(--accent-border);
+  background: var(--bg);
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.failure-actions button:hover,
+.failure-actions a:hover {
+  border-color: var(--accent);
+}
+
+.failure-footnote {
+  font-size: 14px;
+  border-left: 3px solid var(--border);
+  padding-left: 12px;
+}
+
+.failure-footnote code {
+  font-family: var(--mono);
+  background: var(--code-bg);
+  padding: 1px 5px;
+  border-radius: 4px;
+}

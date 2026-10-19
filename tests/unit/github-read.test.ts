@@ -9,6 +9,7 @@ import {
   PendingQueueFullError,
   ReplayRepeatedlyUnreachableError,
   ALL_ERROR_CLASSES,
+  WrongPassphraseError,
 } from "../../src/store/errors"
 import { VAULT_PATH, DATA_BRANCH } from "../../src/config"
 
@@ -279,7 +280,7 @@ test("GithubStore's default fetch (no explicit override) is bound to its require
   }
 })
 
-test("ALL_ERROR_CLASSES lists exactly the eight named error classes, each constructible with no arguments", () => {
+test("ALL_ERROR_CLASSES lists exactly the nine named error classes, each constructible with no arguments", () => {
   // Task 7 amendment: Task 19's failure-recovery UI test enumerates this
   // array to prove every error class renders a visible way forward, so a
   // class silently missing here (or a stray duplicate) would silently
@@ -296,7 +297,14 @@ test("ALL_ERROR_CLASSES lists exactly the eight named error classes, each constr
   // way, by this test failing (`expected [...8] to deeply equal [...6]`)
   // the moment the two classes existed without being named here too.
   // Updated deliberately, not silently, as part of closing that gap.)
+  //
+  // Task 19 / ruling R26a made it NINE: WrongPassphraseError was the one user-facing error class
+  // this array did not enumerate, because it lived in src/vault/crypto.ts rather than
+  // src/store/errors.ts. It has now MOVED here (crypto.ts re-exports it, so every existing
+  // import still resolves to the same class and `instanceof` is unaffected) -- the move rather
+  // than an import being what keeps src/store/errors.ts a zero-import leaf.
   const expected = [
+    WrongPassphraseError,
     StaleWriteError,
     TokenError,
     RepoPublicError,

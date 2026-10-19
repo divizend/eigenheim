@@ -9,6 +9,7 @@ import { renderEditor } from "./ui/editor"
 import { renderConflict } from "./ui/conflict"
 import { renderHistory } from "./ui/history"
 import { renderSettings } from "./ui/settings"
+import { renderFailure } from "./ui/errors"
 import type { Session } from "./session/unlock"
 
 /** The one place a `GithubStore` is constructed from a token (ruling R3's seam, used identically
@@ -98,4 +99,28 @@ async function main(): Promise<void> {
   })
 }
 
-void main()
+/** The last line of defence for spec §13's "no state may dead-end".
+ *
+ * Everything inside the views already handles its own expected failures inline, where the
+ * problem is visible. This catches what none of them did -- a bug, a browser that refuses
+ * IndexedDB (Safari private browsing has historically done exactly that), a storage quota
+ * refusal at startup -- and renders the failure view instead of leaving a blank page with a
+ * message only in the console. A blank page is the one outcome this project cannot ship: a user
+ * looking at nothing has no way to know their vault is still intact and still readable with
+ * `age -d`, which the failure view tells them in every single case. */
+void main().catch((err: unknown) => {
+  const root = document.querySelector<HTMLDivElement>("#app")
+  if (!root) throw err
+  renderFailure(root, err, { onRetry: () => window.location.reload() })
+})
+
+// Same reasoning for anything thrown out of a handler after the initial render -- an unhandled
+// rejection would otherwise be invisible to the user.
+window.addEventListener("unhandledrejection", (event) => {
+  const root = document.querySelector<HTMLDivElement>("#app")
+  if (!root) return
+  // Only when nothing has rendered yet: a rejection raised while a working view is on screen
+  // must NOT replace it, because that view is still the user's text and their way forward.
+  if (root.childElementCount > 0) return
+  renderFailure(root, event.reason, { onRetry: () => window.location.reload() })
+})
