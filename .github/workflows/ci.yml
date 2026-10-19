@@ -1,0 +1,144 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# A later push supersedes an in-flight run on the same ref, except on main, where the build job
+# commits build-hash.txt and two concurrent runs would race each other's push.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: Unit tests and typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # `tsc -b` covers all three composite projects (src, vite.config.ts, tests), so a type
+      # error anywhere -- including in a test file -- fails here rather than at `npm run build`.
+      - run: npx tsc -b
+      # Deliberately the bare suite: it must stay green with no token, no network and no
+      # binaries. The integration and interop suites have their own configs for exactly that
+      # reason, and neither is reachable from here.
+      - run: npm test
+
+  interop:
+    name: Real age CLI interop
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      # The pinned release, verified by checksum before it is ever executed. This binary is the
+      # authority this job appeals to, so taking it on trust from a URL would undermine the
+      # whole point of the check.
+      - name: Fetch and verify age v1.3.2
+        run: |
+          set -euo pipefail
+          curl -fsSL -o age.tar.gz \
+            https://github.com/FiloSottile/age/releases/download/v1.3.2/age-v1.3.2-linux-amd64.tar.gz
+          echo "${{ env.AGE_SHA256 }}  age.tar.gz" | sha256sum -c -
+          tar -xzf age.tar.gz
+          ./age/age --version
+        env:
+          # The same value scripts/make-fixtures.sh pins, and the trust anchor for this
+          # platform: age's releases are signed through a transparency log rather than a hash
+          # this job could independently derive, so this literal IS the check.
+          #
+          # It appears in two files, so tests/unit/ci-config.test.ts asserts they agree -- a
+          # drifted copy here would either break CI on a good release or, worse, silently accept
+          # a bad one. The value was verified by hashing the real downloaded tarball, not copied
+          # from a web page.
+          AGE_SHA256: cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10
+
+      # This is the job defending spec §1's central promise -- that the vault is an ordinary age
+      # file its owner can open with nothing but their passphrase. It runs on every push, not
+      # nightly, because a regression here silently breaks the one guarantee that survives this
+      # app being unavailable.
+      - name: Outbound interop (this app writes, real age reads)
+        run: npm run test:interop
+        env:
+          EIGENHEIM_AGE_BIN: ${{ github.workspace }}/age/age
+
+  e2e:
+    name: End-to-end (real browser)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      # Builds first (playwright.config.ts's webServer does it), so this also proves the
+      # production bundle -- not a dev server -- is what the suite exercised.
+      - run: npm run test:e2e
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 7
+
+  build:
+    name: Build and publish the bundle hash
+    runs-on: ubuntu-latest
+    needs: [unit, interop, e2e]
+    permissions:
+      # Only this job writes, and only on main.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+        env:
+          # Matches what Vercel bakes in, so the hash published here is the hash of the bundle a
+          # user actually runs. Without this the two would differ for a reason that has nothing
+          # to do with tampering, and the Settings panel would cry wolf on every deploy.
+          VERCEL_GIT_COMMIT_SHA: ${{ github.sha }}
+          VERCEL_GIT_REPO_OWNER: ${{ github.repository_owner }}
+          VERCEL_GIT_REPO_SLUG: ${{ github.event.repository.name }}
+
+      - name: Compute build-hash.txt
+        run: ./scripts/publish-build-hash.sh "${{ github.sha }}"
+
+      # main only: a hash published from a branch would describe a bundle nobody is serving, and
+      # the Settings panel fetches this file from main.
+      - name: Commit build-hash.txt
+        if: github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- build-hash.txt; then
+            echo "build-hash.txt unchanged; nothing to commit."
+            exit 0
+          fi
+          git add build-hash.txt
+          # [skip ci] so publishing a hash does not trigger a run that republishes it.
+          git commit -m "ci: publish build hash for ${GITHUB_SHA::7} [skip ci]"
+          git push

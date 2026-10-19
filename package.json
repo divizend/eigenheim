@@ -12,7 +12,8 @@
     "preview": "vite preview",
     "test": "vitest run",
     "test:integration": "vitest run --config vitest.integration.config.ts",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "test:interop": "vitest run --config vitest.interop.config.ts"
   },
   "dependencies": {
     "age-encryption": "0.3.1",
