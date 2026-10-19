@@ -7,6 +7,13 @@
 // this is what lets a test select `getByRole("button", { name: /continue/i })` with no extra
 // scoping.
 //
+// Not a strictly forward-only sequence: step 6's `TokenError` recovery routes back to step 3
+// (ruling R30), so any step can in principle be rendered more than once within one setup. Every
+// render function therefore has to read what it needs out of `WizardState` rather than
+// regenerating it -- see `prefillPassphrase`, which exists precisely because step 4 did not, and
+// would have silently handed a returning user a different passphrase than the one on the recovery
+// sheet they already printed. Keep that property when adding steps or back-routes here.
+//
 // This file has no Node types available (tsconfig.app.json covers `src/`) and must stay that way.
 
 import type { GithubStore } from "../store/github"
@@ -233,11 +240,21 @@ function escapeHtml(s: string): string {
  * validation and step 6's initialize attempt (review finding 3): `RepoPublicError`/`TokenError`
  * can both recur at step 6 too -- e.g. the repo flips public again in the gap between step 3's
  * check and clicking "Create my vault" at step 6 -- and spec §13's "a visible way forward"
- * requirement does not expire after the first time an error type is shown. Returns HTML only,
- * no button: step 3 appends its own "Check again" (which re-validates the token step's own
- * fields); step 6 doesn't need an equivalent button, since its own "Create my vault" button is
- * already re-clickable and re-runs the exact same attempt. */
-function errorRecoveryHtml(err: unknown): string {
+ * requirement does not expire after the first time an error type is shown.
+ *
+ * Returns HTML only, never a button: each step appends whatever affordance actually works *there*
+ * (step 3 its own "Check again", which re-validates its own fields; step 6 its own route back to
+ * step 3 for the one error step 6 cannot act on). The copy below is therefore written to be true
+ * at BOTH call sites -- re-review NEW-1 / ruling R30 is precisely what happens when it is not:
+ * the TokenError branch used to say "Follow the steps above again", which named step 3's
+ * walkthrough markup and silently became a lie the moment fix round 1 reused this function at
+ * step 6, where that markup does not exist. Nothing positional ("above", "below") and nothing
+ * naming a control that only one step has belongs in here.
+ *
+ * Exported (re-review NEW-3) solely so tests/unit/setup.test.ts can cover all three branches and
+ * the escaping without a browser: this is a pure `(err: unknown) => string`, and before that it
+ * was reachable only through two ~6.5s Playwright tests that between them touched one branch. */
+export function errorRecoveryHtml(err: unknown): string {
   if (err instanceof RepoPublicError) {
     const settingsUrl = `https://github.com/${repoOwner()}/${repoSlug()}/settings`
     return `
@@ -249,8 +266,10 @@ function errorRecoveryHtml(err: unknown): string {
   if (err instanceof TokenError) {
     return `
       <p>${escapeHtml(err.message)}</p>
-      <p>Follow the steps above again, or
-        <a href="${TOKEN_CREATE_URL}" target="_blank" rel="noopener">create a new token</a>.</p>
+      <p>This token cannot be used as it is.
+        <a href="${TOKEN_CREATE_URL}" target="_blank" rel="noopener">Create a new token</a> with
+        <strong>Contents: Read and write</strong> on <code>${repoOwner()}/${repoSlug()}</code>,
+        then enter it again.</p>
     `
   }
   return `<p>${escapeHtml(err instanceof Error ? err.message : String(err))}</p>`
@@ -262,8 +281,26 @@ function errorRecoveryHtml(err: unknown): string {
 // `checkPassphrase` alone; this step only surfaces its verdict.
 // ---------------------------------------------------------------------------------------------
 
+/** What step 4's passphrase field is prefilled with: the passphrase already chosen in this
+ * setup, if there is one, and a freshly generated one otherwise (spec §5.5's six diceware words).
+ *
+ * The `existing` branch exists because of ruling R30: step 6's `TokenError` recovery routes back
+ * to step 3, so step 4 can be rendered a SECOND time within one setup. Generating unconditionally
+ * -- which is what this step did before -- would have walked that user forward with a different
+ * passphrase than the one on the recovery sheet they already printed at step 5, silently
+ * invalidating the only artifact this project offers in place of a password reset (spec §2: no
+ * recovery key, no reset, ever). Making the wizard re-entrant is the point, not a side effect:
+ * six more UI tasks follow this file's structure.
+ *
+ * A separate exported function rather than two lines inline, for ruling R28's reason -- it is the
+ * whole of the decision, it is pure, and tests/unit/setup.test.ts can therefore pin it without a
+ * browser. */
+export function prefillPassphrase(existing: string): string {
+  return existing.length > 0 ? existing : generatePassphrase()
+}
+
 function renderPassphraseStep(root: HTMLElement, deps: Deps, state: WizardState): void {
-  const generated = generatePassphrase()
+  const prefill = prefillPassphrase(state.passphrase)
 
   root.innerHTML = shell(
     4,
@@ -284,7 +321,7 @@ function renderPassphraseStep(root: HTMLElement, deps: Deps, state: WizardState)
   )
 
   const passphraseInput = required<HTMLInputElement>(root, "#passphrase-input")
-  passphraseInput.value = generated
+  passphraseInput.value = prefill
   const confirmInput = required<HTMLInputElement>(root, "#passphrase-confirm")
   const floorFeedback = required<HTMLParagraphElement>(root, "#passphrase-feedback")
   const matchFeedback = required<HTMLParagraphElement>(root, "#match-feedback")
@@ -387,7 +424,13 @@ export interface FinishSetupParams {
  *
  * Sequential throughout, never `Promise.all`: this project's own Global Constraint is that the
  * two scrypt runs (encrypting the empty vault, wrapping the device identity) must never be
- * concurrent (spec §5.4). */
+ * concurrent (spec §5.4) -- two logN=17 runs in flight at once peak near 256 MiB and can get a
+ * mobile tab discarded, which costs a user access to their own data. Spec §11 is explicit that
+ * this sentence is not enough on its own, because the constraint "would read like a pointless
+ * pessimisation to a future optimiser", so it is pinned by tests/unit/setup.test.ts's
+ * "finishSetup never runs two scrypt operations concurrently" (re-review NEW-2 -- until that
+ * test existed, nothing in the suite would have failed on a `Promise.all` of these two lines,
+ * verified by making exactly that change and watching all 138 tests pass but one). */
 export async function finishSetup(params: FinishSetupParams, local: LocalStore): Promise<Session> {
   const armored = await encryptVault("", params.passphrase)
   const { sha } = await params.store.initializeDataBranch({ armored })
@@ -435,7 +478,25 @@ function renderInitializeStep(root: HTMLElement, deps: Deps, state: WizardState)
         // -- the repo can flip public again, or the token can be revoked, in the gap between
         // step 3's check and clicking "Create my vault", and spec §13's "visible way forward"
         // applies on every occurrence, not just the first.
-        feedback.innerHTML = errorRecoveryHtml(err)
+        //
+        // Re-review NEW-1 / ruling R30: the shared message alone is a way forward for only ONE of
+        // those two. `RepoPublicError` is genuinely actionable from here as-is -- its own link
+        // goes to the repo's settings, and this step's "Create my vault" button is already
+        // re-clickable, so flip the repo private and click again. `TokenError` is not: a broken
+        // token cannot be fixed from a step that has no token field, and re-clicking just re-runs
+        // the identical attempt with the identical token, forever. So that one branch, and only
+        // that one, gets its own affordance -- back to step 3, where the walkthrough and the input
+        // actually are -- appended to the shared message exactly the way step 3 appends its own
+        // "Check again" to it. Routing back is safe to do mid-wizard only because
+        // `prefillPassphrase` makes step 4 re-entrant; see its doc comment.
+        if (err instanceof TokenError) {
+          feedback.innerHTML = `${errorRecoveryHtml(err)}<button type="button" id="retoken-btn">Enter a different token</button>`
+          required<HTMLButtonElement>(root, "#retoken-btn").addEventListener("click", () =>
+            renderTokenStep(root, deps, state),
+          )
+        } else {
+          feedback.innerHTML = errorRecoveryHtml(err)
+        }
         feedback.hidden = false
         finishBtn.disabled = false
       }

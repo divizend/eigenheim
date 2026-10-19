@@ -266,6 +266,12 @@ test.describe("setup wizard", () => {
     const generatedPassphrase = await page.getByLabel(/^passphrase$/i).inputValue()
     await page.getByLabel(/confirm passphrase/i).fill(generatedPassphrase)
     await page.getByRole("button", { name: /continue/i }).click()
+    // Assert the intermediate step before clicking the next identically-named button (re-review
+    // item 5, matching test 6 above). Risk today is zero -- `renderSheetStep` is synchronous, so
+    // Playwright always re-resolves the selector onto step 5's own "Continue" -- but two
+    // consecutive clicks on a same-named button with nothing asserted between them encode a
+    // latent assumption about that, and the assertion costs one line.
+    await expect(page.getByTestId("recovery-sheet")).toBeVisible()
     await page.getByRole("button", { name: /continue/i }).click() // past the recovery sheet, onto step 6
 
     await page.getByRole("button", { name: /create my vault/i }).click()
@@ -276,5 +282,70 @@ test.describe("setup wizard", () => {
     // The guard fired before any write: no blob/tree/commit/ref call ever happened.
     const dataWriteCalls = calls.filter((c) => c.path.includes("/git/blobs") || c.path.includes("/git/trees") || c.path.includes("/git/commits") || c.path.includes("/git/refs"))
     expect(dataWriteCalls).toEqual([])
+  })
+  // Re-review NEW-1 / ruling R30: a `TokenError` at step 6 was a hard dead end. The shared
+  // message rendered there was step 3's ("Follow the steps above again, or create a new token"),
+  // but at step 6 the walkthrough markup does not exist, the wizard has no Back button anywhere,
+  // and there is no token field to paste a replacement into -- so the only on-screen action
+  // ("Create my vault") re-ran the identical attempt with the same broken token and failed
+  // identically, forever. Spec §13 opens with "No state may dead-end", so the fix is a real way
+  // forward and not merely honest copy: step 6's TokenError branch appends its own affordance, a
+  // button back to step 3, mirroring how step 3 appends its own "Check again" to the same shared
+  // message.
+  //
+  // `repoResponses` drives the whole route, consumed in order across this flow's three real
+  // `assertRepoWritable` calls:
+  //   1. step 3's `ensureSetup`               -- private, push    -> passes, on to step 4
+  //   2. step 6's `initializeDataBranch`      -- private, NO push -> TokenError (spec §6.7)
+  //   3. step 3's `ensureSetup`, second time  -- private, push    -> passes again, back to step 4
+  // Note this is a DIFFERENT failure from the test above it: there the repo flipped public
+  // (RepoPublicError, which stays as-is because "flip the repo private, click again" is already
+  // actionable from step 6); here the token itself loses write access, which nothing on step 6
+  // can act on.
+  test("a token that loses write access by step 6 offers a way back to the token step, and keeps the passphrase already printed (ruling R30)", async ({
+    page,
+  }) => {
+    const { calls } = await installGithubMock(page, {
+      repoResponses: [
+        { private: true, permissions: { push: true } },
+        { private: true, permissions: { push: false } },
+        { private: true, permissions: { push: true } },
+      ],
+    })
+    await driveToPassphraseStep(page)
+
+    const generatedPassphrase = await page.getByLabel(/^passphrase$/i).inputValue()
+    await page.getByLabel(/confirm passphrase/i).fill(generatedPassphrase)
+    await page.getByRole("button", { name: /continue/i }).click()
+    await expect(page.getByTestId("recovery-sheet")).toBeVisible() // see item 5's note above
+    await page.getByRole("button", { name: /continue/i }).click()
+
+    await page.getByRole("button", { name: /create my vault/i }).click()
+
+    // 10s, not the 5s default: `finishSetup` runs a real logN=17 scrypt encrypt of the empty
+    // vault BEFORE it ever calls `initializeDataBranch`, so this failure cannot surface any
+    // faster than that costs in a real browser (same reasoning as test 6's own timeout).
+    const backBtn = page.getByRole("button", { name: /enter a different token/i })
+    await expect(backBtn).toBeVisible({ timeout: 10_000 })
+    // ...and the copy that named step 3's absent walkthrough is gone, not merely supplemented.
+    await expect(page.getByText(/steps above/i)).toHaveCount(0)
+
+    // The way forward has to do real work, not just exist -- same standard test 4 holds "Check
+    // again" to.
+    await backBtn.click()
+    await expect(page.getByText(/step 3 of 6/i)).toBeVisible()
+    await page.getByLabel(/personal access token/i).fill(VALID_TOKEN)
+    await page.getByRole("button", { name: /continue/i }).click()
+    await expect(page.getByLabel(/^passphrase$/i)).toBeVisible()
+
+    // Ruling R30's second half, and the reason the button above is only safe together with it:
+    // step 4 is now reachable twice within one setup, and the user already printed the recovery
+    // sheet carrying THIS passphrase at step 5. Generating a fresh one on the second render would
+    // silently invalidate the only artifact this project offers instead of a password reset.
+    expect(await page.getByLabel(/^passphrase$/i).inputValue()).toBe(generatedPassphrase)
+
+    // Nothing was ever written to the repo by the failed attempt: `assertRepoWritable` runs at the
+    // top of `initializeDataBranch`, before any blob/tree/commit/ref call.
+    expect(calls.filter((c) => c.method === "POST")).toEqual([])
   })
 })

@@ -673,20 +673,36 @@ test("the queue can drain multiple entries in one call as independent commits wh
 })
 
 test("replay stops at the first conflict, leaving any later queued entries untouched for a future call", async () => {
-  // Explicit 20s timeout (vitest's default is 5s): this test's own setup plus replay path runs
-  // NINE sequential logN=17 scrypt operations by construction -- encryptVault x5 across the
-  // setup and fixtures (three enqueued entries plus the two readHeadFixtures/
-  // commitTreeBlobFixtures armored fixtures), decryptVault x4 inside replay itself
-  // (replayPendingCommits' own per-entry `mineText` decrypt, once each for "A" and "B", plus
-  // attemptWrite's two conflict-path decrypts for "theirs"/"base") -- never concurrently, per this
-  // project's own Global Constraint (spec §5.4) -- which this box's shared, cgroup-throttled CPU
-  // (confirmed live: `cat /sys/fs/cgroup/cpu.max` reports a 12-core quota against `nproc`'s 16,
-  // and `cpu.stat`'s nr_throttled/throttled_usec are both nonzero) can push past 5s under
-  // contention from other concurrent sessions on this box, even though the test's own logic is
-  // correct -- reproduced deterministically 2 of 3 runs in one sitting, and confirmed NOT a logic
-  // bug by rerunning the identical test with only the timeout raised (`--testTimeout=20000`),
-  // which passed every time. 20s leaves wide margin over the ~5s actually observed even while
-  // throttled.
+  // Explicit 20s timeout (vitest's default is 5s). This whole test body -- setup, replay, AND
+  // its own closing assertion -- runs TEN sequential logN=17 scrypt operations, never
+  // concurrently (this project's own Global Constraint, spec §5.4), and that is essentially the
+  // entirety of its wall clock.
+  //
+  // Ten is MEASURED, not counted by reading the call sites: a temporary stack-logging probe
+  // wrapped around encryptVault/decryptVault in src/vault/crypto.ts, run against this single
+  // test by name, reported exactly `enc=5 dec=5`, with these origins in the captured stacks --
+  //   encryptVault x5 -- the three `enqueuePendingCommit` fixtures ("A", "B", "C"), plus the
+  //     `aArmored` and `baseArmored` fixtures the mocked store answers reads with.
+  //   decryptVault x5 -- replayPendingCommits' own per-entry `mineText` decrypt, once each for
+  //     "A" and "B"; attemptWrite's two conflict-path decrypts for "theirs"/"base"; and this
+  //     test's own final `decryptVault(remaining[0].armored, PASS)`, which is how the
+  //     `"C" was never even attempted` assertion reads the still-queued entry back.
+  // That last one is why counting by eye got this wrong twice (seven, then nine): it sits in an
+  // assertion rather than in the code under test, so a count scoped to "setup plus replay" misses
+  // it -- while the ~0.5s it costs is exactly the kind of wall clock this timeout exists to
+  // cover. Hence the deliberately unscoped framing above: the number and the covered wall clock
+  // have to be the same thing. Re-measure the same way before editing this number again.
+  //
+  // Why 20s and not 5s: three consecutive runs of this single test on this box measured 4.94s,
+  // 5.07s and 4.96s -- straddling vitest's 5s default (ten ops over ~5s is ~0.5s each, in line
+  // with spec §5.4's own measured 407 ms encrypt / 402 ms decrypt). This box's CPU is a shared,
+  // cgroup-throttled quota (confirmed live again here: `cat /sys/fs/cgroup/cpu.max` reports
+  // `1200000 100000`, a 12-core quota against `nproc`'s 16, and `cpu.stat` shows nr_throttled
+  // 1392 / throttled_usec 256723616, both nonzero), so contention from other concurrent sessions
+  // pushes that over the line with nothing about this test's own logic being wrong -- which is
+  // what commit 2824951 established when the timeout was first raised, by rerunning the
+  // identical test with only `--testTimeout=20000` changed and no assertion touched. 20s leaves
+  // wide margin over the ~5s this actually costs even while throttled.
   // The ordinary multi-entry shape: all three entries share the identical original base (the
   // realistic case for one offline episode -- nothing succeeded in between to advance any of
   // them). "A" fast-forwards cleanly; that is exactly what makes "B" (same base) stale the
