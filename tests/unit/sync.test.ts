@@ -673,6 +673,17 @@ test("the queue can drain multiple entries in one call as independent commits wh
 })
 
 test("replay stops at the first conflict, leaving any later queued entries untouched for a future call", async () => {
+  // Explicit 20s timeout (vitest's default is 5s): this test's own setup plus replay path runs
+  // SEVEN sequential logN=17 scrypt operations by construction (encryptVault x5 across the setup
+  // and fixtures, decryptVault x2 inside the conflict path) -- never concurrently, per this
+  // project's own Global Constraint (spec §5.4) -- which this box's shared, cgroup-throttled CPU
+  // (confirmed live: `cat /sys/fs/cgroup/cpu.max` reports a 12-core quota against `nproc`'s 16,
+  // and `cpu.stat`'s nr_throttled/throttled_usec are both nonzero) can push past 5s under
+  // contention from other concurrent sessions on this box, even though the test's own logic is
+  // correct -- reproduced deterministically 2 of 3 runs in one sitting, and confirmed NOT a logic
+  // bug by rerunning the identical test with only the timeout raised (`--testTimeout=20000`),
+  // which passed every time. 20s leaves wide margin over the ~5s actually observed even while
+  // throttled.
   // The ordinary multi-entry shape: all three entries share the identical original base (the
   // realistic case for one offline episode -- nothing succeeded in between to advance any of
   // them). "A" fast-forwards cleanly; that is exactly what makes "B" (same base) stale the
@@ -715,7 +726,7 @@ test("replay stops at the first conflict, leaving any later queued entries untou
   const remaining = await local.getPendingCommits()
   expect(remaining.length).toBe(1)
   expect(await decryptVault(remaining[0].armored, PASS)).toBe("C\n")
-})
+}, 20_000)
 
 test("a single still-unreachable replay attempt returns a structured outcome without throwing, and records the attempt", async () => {
   const local = new LocalStore()
