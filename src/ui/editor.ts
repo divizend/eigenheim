@@ -65,6 +65,10 @@ export interface EditorDeps extends SessionIO {
    * alone -- `commit` would re-derive the base from the draft/session and be refused again. That
    * is a gap in Task 12's data, not in this seam. */
   onConflict: (conflict: Conflict, reopen: (text: string) => void) => void
+  /** Leaves the editor for the history view (task 16), handing over the text currently on
+   * screen so history diffs against what the user is actually looking at rather than against
+   * the last committed version. */
+  onOpenHistory: (text: string) => void
 }
 
 /** What the editor shows the moment it mounts -- see {@link openDocument}. */
@@ -382,7 +386,17 @@ export function renderEditor(root: HTMLElement, deps: EditorDeps): void {
   notice.dataset.testid = "editor-notice"
   notice.setAttribute("role", "status")
 
-  status.append(indicator, notice)
+  // The one piece of chrome spec §8's "no competing chrome" tolerates: history is unreachable
+  // otherwise, and a vault whose previous versions cannot be opened is a vault whose git history
+  // only helps someone with a terminal.
+  const historyBtn = document.createElement("button")
+  historyBtn.type = "button"
+  historyBtn.className = "editor-nav"
+  historyBtn.dataset.testid = "open-history"
+  historyBtn.textContent = "History"
+  historyBtn.addEventListener("click", () => deps.onOpenHistory(textarea.value))
+
+  status.append(indicator, notice, historyBtn)
   container.append(textarea, status)
   root.replaceChildren(container)
 

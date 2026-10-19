@@ -7,6 +7,7 @@ import { renderSetup } from "./ui/setup"
 import { renderUnlock } from "./ui/unlock"
 import { renderEditor } from "./ui/editor"
 import { renderConflict } from "./ui/conflict"
+import { renderHistory } from "./ui/history"
 import type { Session } from "./session/unlock"
 
 /** The one place a `GithubStore` is constructed from a token (ruling R3's seam, used identically
@@ -34,6 +35,24 @@ function openEditor(root: HTMLElement, local: LocalStore, session: Session): voi
         session,
         io: { local, makeStore },
         onResolved: (text) => reopen(text),
+      })
+    },
+    onOpenHistory: (text) => {
+      // History diffs against what is ON SCREEN, so the session carries the unsaved text across
+      // -- otherwise "what would restoring change" would answer a question about the last
+      // committed version rather than the one the user is looking at.
+      session.text = text
+      renderHistory(root, {
+        session,
+        io: { local, makeStore },
+        onClose: (resolved) => {
+          // The SAME session object, mutated -- never a `{...session}` copy. `resolveConflict`
+          // and `restoreVersion` both advance `session.baseSha` in place, so a copy taken here
+          // would fork identity with whatever still holds the original and let the two drift.
+          // One session object exists per unlock, and every view shares it.
+          session.text = resolved
+          openEditor(root, local, session)
+        },
       })
     },
   })

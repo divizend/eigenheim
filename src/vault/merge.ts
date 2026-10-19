@@ -18,7 +18,14 @@ import { diff3Merge } from "node-diff3"
  * `"\r"` corruption on merge (Review Focus 1). Only the last element of the
  * result can ever lack a trailing terminator -- every earlier split happens
  * right after a `"\n"` by construction. */
-function splitLines(text: string): string[] {
+/** Exported for the history view's diff (task 16), which must split a document into lines
+ * exactly the way this file does or a CRLF vault renders as every single line changed.
+ *
+ * Deliberately shared rather than copied: the lookbehind keeps each line's own terminator
+ * attached, which is the entire reason CRLF survives a round trip here, and two copies of that
+ * regex that must agree is exactly the kind of thing that drifts silently. One definition, one
+ * place to be right. */
+export function splitLines(text: string): string[] {
   return text.split(/(?<=\n)/)
 }
 

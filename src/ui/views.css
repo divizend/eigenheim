@@ -400,3 +400,155 @@
   padding: 8px 12px;
   margin: 0 0 10px;
 }
+
+/* A quiet nav control living in the editor's status line (src/ui/editor.ts). Styled as a link
+   rather than a button so spec §8's "no competing chrome" survives having one: it must be
+   reachable without drawing the eye away from the document. */
+.editor-nav {
+  margin-left: auto;
+  font-family: var(--sans);
+  font-size: 13px;
+  padding: 2px 6px;
+  border: none;
+  background: none;
+  color: var(--accent);
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+/* ---------------------------------------------------------------------------------------------
+   History view (src/ui/history.ts). A log on the left, one version's diff on the right.
+   --------------------------------------------------------------------------------------------- */
+
+.history {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 32px 24px 64px;
+  text-align: left;
+}
+
+.history-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.history-head h1 {
+  font-family: var(--heading);
+  color: var(--text-h);
+  margin: 0;
+}
+
+.history-head button {
+  font-family: var(--sans);
+  font-size: 14px;
+  padding: 8px 16px;
+  border-radius: 6px;
+  border: 2px solid var(--border);
+  background: var(--bg);
+  color: var(--text-h);
+  cursor: pointer;
+}
+
+.history-body {
+  display: grid;
+  grid-template-columns: minmax(220px, 300px) 1fr;
+  gap: 24px;
+  margin-top: 20px;
+}
+
+@media (max-width: 760px) {
+  .history-body {
+    grid-template-columns: 1fr;
+  }
+}
+
+.history-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 60vh;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.history-entry {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  text-align: left;
+  padding: 10px 12px;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  background: none;
+  cursor: pointer;
+  font-family: var(--sans);
+}
+
+.history-entry:hover {
+  background: var(--accent-bg);
+}
+
+.history-when {
+  font-size: 13px;
+  color: var(--text-h);
+}
+
+.history-what {
+  font-size: 12px;
+  color: var(--text);
+}
+
+.history-detail h2 {
+  font-family: var(--mono);
+  font-size: 14px;
+  color: var(--text-h);
+  margin: 0 0 12px;
+}
+
+.history-detail > button {
+  font-family: var(--sans);
+  font-size: 14px;
+  padding: 8px 16px;
+  margin-top: 14px;
+  border-radius: 6px;
+  border: 2px solid var(--accent-border);
+  background: var(--bg);
+  color: var(--accent);
+  cursor: pointer;
+}
+
+.history-diff {
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.5;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+  margin: 0;
+  max-height: 55vh;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Colour is never the only signal -- every line also carries a literal "+ ", "- " or "  "
+   prefix set in src/ui/history.ts, so the diff is readable without colour vision. */
+.diff-added {
+  display: block;
+  background: rgba(34, 160, 90, 0.16);
+}
+
+.diff-removed {
+  display: block;
+  background: rgba(220, 70, 70, 0.16);
+}
+
+.diff-same {
+  display: block;
+  color: var(--text);
+}
