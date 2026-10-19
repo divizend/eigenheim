@@ -47,6 +47,16 @@ export interface Conflict {
   theirs: string
   merged: string
   conflicted: boolean
+  /** The commit sha `theirs` was read from — i.e. the head that refused this write.
+   *
+   * Added for the conflict view (task 15), which has to commit the resolution on the NEW base;
+   * without it that is impossible from a `Conflict` alone, because {@link commit} derives its
+   * base from the draft or the session, both of which still hold the sha that was just refused,
+   * so resolving would be refused again forever. Carrying the sha the conflict was actually
+   * computed against also keeps the resolution honest if head moves a THIRD time: the write is
+   * refused again and a fresh conflict opens on the newer head, rather than silently
+   * overwriting whatever arrived in between. */
+  theirsSha: string
 }
 
 /** `commit`'s result is the brief's own two cases -- `{ sha }` (written) or `{ conflict }`
@@ -247,7 +257,9 @@ async function attemptWrite(
       const theirsText = await decryptVault(theirs.armored, s.passphrase)
       const baseText = await decryptVault(baseArmored, s.passphrase)
       const { text: merged, conflicted } = merge3(baseText, pending.mineText, theirsText)
-      return { conflict: { base: baseText, mine: pending.mineText, theirs: theirsText, merged, conflicted } }
+      return {
+        conflict: { base: baseText, mine: pending.mineText, theirs: theirsText, merged, conflicted, theirsSha: theirs.sha },
+      }
     }
     if (isUnreachable(err)) return { unreachable: true }
     throw err

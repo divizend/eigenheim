@@ -6,6 +6,7 @@ import { repoOwner, repoSlug } from "./config"
 import { renderSetup } from "./ui/setup"
 import { renderUnlock } from "./ui/unlock"
 import { renderEditor } from "./ui/editor"
+import { renderConflict } from "./ui/conflict"
 import type { Session } from "./session/unlock"
 
 /** The one place a `GithubStore` is constructed from a token (ruling R3's seam, used identically
@@ -18,18 +19,22 @@ function makeStore(token: string): GithubStore {
 
 /** Mounts the editor on an unlocked session.
  *
- * `onConflict` is Task 15's seam and is a deliberate, non-dead-ended no-op until that task lands
- * (see {@link renderEditor}'s own doc on it): by the time it is called the editor has already
- * kept the user's text on screen, persisted the draft to IndexedDB, and shown the conflict
- * notice -- so the state a user reaches here is "your edit is safe locally, another device got
- * there first", not a hole. Task 15 replaces this one line with the three-way view. */
+ * `onConflict` hands off to the three-way view (task 15). The editor has already kept the user's
+ * text on screen and persisted the draft before calling this, so the handoff never depends on
+ * the conflict view succeeding -- and the conflict view, on resolving, calls `reopen` with the
+ * settled text, which re-mounts this editor on it. */
 function openEditor(root: HTMLElement, local: LocalStore, session: Session): void {
   renderEditor(root, {
     local,
     makeStore,
     session,
-    onConflict: () => {
-      /* Task 15: renderConflict(root, conflict, reopen). */
+    onConflict: (conflict, reopen) => {
+      renderConflict(root, {
+        conflict,
+        session,
+        io: { local, makeStore },
+        onResolved: (text) => reopen(text),
+      })
     },
   })
 }

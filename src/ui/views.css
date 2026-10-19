@@ -282,3 +282,121 @@
 .editor-notice {
   color: var(--text-h);
 }
+
+/* ---------------------------------------------------------------------------------------------
+   Conflict view (src/ui/conflict.ts). Spec §6.5: all three versions visible, nothing discarded
+   unseen -- so the two sides sit side by side at full width rather than behind a toggle, and the
+   common ancestor is one disclosure away rather than absent.
+   --------------------------------------------------------------------------------------------- */
+
+.conflict {
+  max-width: 1000px;
+  margin: 0 auto;
+  padding: 40px 24px 64px;
+  text-align: left;
+}
+
+.conflict h1 {
+  font-family: var(--heading);
+  color: var(--text-h);
+  margin: 0 0 12px;
+}
+
+.conflict h2 {
+  font-family: var(--sans);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-h);
+  margin: 24px 0 8px;
+}
+
+.conflict p {
+  color: var(--text);
+  line-height: 1.6;
+}
+
+/* Side by side where there is room, stacked where there is not. Both panes are always present
+   in the DOM either way -- "nothing is discarded unseen" is not a property that may depend on
+   viewport width. */
+.conflict-panes {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 20px;
+}
+
+.conflict-pane h2 {
+  margin-top: 16px;
+}
+
+.conflict-pane pre,
+.conflict-base pre {
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.5;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+  margin: 0 0 10px;
+  max-height: 320px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.conflict-pane button {
+  font-family: var(--sans);
+  font-size: 14px;
+  padding: 8px 16px;
+  border-radius: 6px;
+  border: 2px solid var(--border);
+  background: var(--bg);
+  color: var(--text-h);
+  cursor: pointer;
+}
+
+.conflict-pane button:hover {
+  border-color: var(--accent-border);
+}
+
+.conflict-base {
+  margin: 24px 0;
+}
+
+.conflict-base summary {
+  cursor: pointer;
+  color: var(--text);
+  font-size: 14px;
+  margin-bottom: 10px;
+}
+
+.conflict-merged {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 280px;
+  resize: vertical;
+  font-family: var(--mono);
+  font-size: 14px;
+  line-height: 1.6;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text-h);
+}
+
+.conflict-merged:focus {
+  outline: 2px solid var(--accent-border);
+  outline-offset: 1px;
+}
+
+/* Deliberately not `.wizard-feedback`: unresolved markers are a note about the text, not an
+   error about the app, and dressing them identically would make a routine state look broken. */
+.conflict-marker-note {
+  font-size: 14px;
+  color: var(--text-h);
+  background: var(--code-bg);
+  border-left: 3px solid var(--accent);
+  padding: 8px 12px;
+  margin: 0 0 10px;
+}
