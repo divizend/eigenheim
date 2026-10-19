@@ -166,17 +166,119 @@
   border-color: var(--accent-border);
 }
 
-[data-testid="editor-placeholder"] {
+/* ---------------------------------------------------------------------------------------------
+   Unlock view (src/ui/unlock.ts). Deliberately the same column as the wizard: a returning user
+   should recognise the page they set up, not meet a differently-shaped app.
+   --------------------------------------------------------------------------------------------- */
+
+.unlock {
   max-width: 640px;
-  margin: 48px auto;
-  padding: 0 20px;
+  margin: 0 auto;
+  padding: 64px 24px;
+}
+
+.unlock h1 {
+  font-family: var(--heading);
+  color: var(--text-h);
+  margin: 0 0 12px;
+}
+
+.unlock p {
+  color: var(--text);
+  line-height: 1.6;
+}
+
+.unlock label {
+  display: block;
+  margin: 20px 0 6px;
+  color: var(--text-h);
+  font-size: 14px;
+}
+
+.unlock input[type="password"] {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: var(--mono);
+  font-size: 15px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text-h);
+}
+
+.unlock input[type="password"]:focus {
+  outline: 2px solid var(--accent-border);
+  outline-offset: 1px;
+}
+
+/* Not `.wizard-feedback`: progress is neither an error nor an action, and must not be dressed as
+   one. It is the only thing on screen during a 0.4-2s scrypt run (spec §5.4), so it is quiet but
+   always present rather than appearing and disappearing. */
+.unlock-progress {
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.6;
+  margin: 12px 0 0;
+}
+
+/* ---------------------------------------------------------------------------------------------
+   Editor (src/ui/editor.ts). Spec §8: "one monospace text file", full viewport, no competing
+   chrome. The textarea IS the app -- everything else here is a single status line.
+   --------------------------------------------------------------------------------------------- */
+
+/* Set on #app by renderEditor, so the full-height chain html -> body -> #app -> .editor is
+   unbroken. Without this the textarea's own `flex: 1` has no height to fill and collapses to its
+   default rows, which is exactly the "fills the viewport" property the E2E test measures. */
+/* `#app.editor-root`, not `.editor-root`: src/style.css's `#app` rule is an ID selector
+   (specificity 1-0-0) and already sets `text-align: center` plus `min-height: 100svh`, so a bare
+   class here loses to it. Centred text is right for the wizard's prose and wrong for a monospace
+   document, and `min-height` alone gives the flex child nothing definite to fill against. */
+#app.editor-root {
+  height: 100svh;
   text-align: left;
 }
 
-[data-testid="editor-placeholder"] pre {
+.editor {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.editor-text {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  box-sizing: border-box;
+  resize: none;
+  border: none;
+  outline: none;
+  padding: 24px;
   font-family: var(--mono);
-  background: var(--code-bg);
-  padding: 14px;
-  border-radius: 6px;
-  min-height: 200px;
+  font-size: 15px;
+  line-height: 1.6;
+  tab-size: 4;
+  background: var(--bg);
+  color: var(--text-h);
+}
+
+.editor-status {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 24px;
+  border-top: 1px solid var(--border);
+  background: var(--social-bg);
+  font-family: var(--sans);
+  font-size: 13px;
+  color: var(--text);
+}
+
+.editor-indicator {
+  white-space: nowrap;
+}
+
+.editor-notice {
+  color: var(--text-h);
 }

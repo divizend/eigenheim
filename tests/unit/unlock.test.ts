@@ -229,6 +229,40 @@ test("on a device's first unlock: token, then fetch, then vault", async () => {
   ])
 })
 
+test("a first unlock caches the fetched ciphertext, so the NEXT unlock needs no network", async () => {
+  // spec §5.3: "The last-known `vault.age` ciphertext and its commit SHA are cached in
+  // IndexedDB", and that cache is the whole mechanism behind "Unlock requires no network at
+  // all" plus the two-branch ordering above -- "First unlock on a new device has no cached
+  // ciphertext... That happens once per device". Nothing else in this project writes that slot
+  // on this path: `grep -rn 'putCachedVault' src/` reports src/store/local.ts (the method
+  // itself), src/ui/setup.ts:447 (first-ever device), src/session/sync.ts:137 and :248 (a
+  // background sync that found a newer remote, and a successful commit) -- so without this
+  // write, a device paired by transfer (task 18) would take the slow, network-dependent branch
+  // on EVERY unlock until it happened to commit or to see a remote change, and would be unable
+  // to unlock offline at all.
+  const local = new LocalStore()
+  await seedDeviceAndToken(local, PASS, "gh-token-caches")
+  const vaultArmored = await encryptVault("fetched once\n", PASS)
+  const makeStore = makeStoreFor([], readHeadFixtures(vaultArmored, "remote-commit-7"))
+
+  await unlock({ passphrase: PASS, local, makeStore })
+
+  expect(await local.getCachedVault()).toEqual({ armored: vaultArmored, sha: "remote-commit-7" })
+
+  // The real point, asserted rather than inferred: a second unlock now takes the cached branch,
+  // which refuses to build a store at all.
+  const stages: Stage[] = []
+  const second = await unlock({
+    passphrase: PASS,
+    local,
+    makeStore: makeStoreMustNotBeCalled(),
+    onStage: (s) => stages.push(s),
+  })
+  expect(stages).toEqual(["vault", "token"])
+  expect(second.text).toBe("fetched once\n")
+  expect(second.baseSha).toBe("remote-commit-7")
+})
+
 test("never runs two scrypt operations concurrently", async () => {
   // spec §11/§5.4 -- concurrency here peaks ~256 MiB and gets mobile tabs killed. Invisible in
   // the code and reads like a pointless pessimisation; pinned here. Exercises the first-unlock

@@ -212,5 +212,17 @@ export async function unlock(opts: {
   onStage?.("vault")
   const text = await decryptVault(head.armored, resolved)
 
+  // Caching the just-fetched ciphertext is what makes this branch happen "once per device"
+  // (spec §5.3) rather than on every unlock: with no cached `vault.age`, the branch above is
+  // selected again next time, so unlock would need the network forever -- and spec §5.3's
+  // "Unlock requires no network at all, which the PWA story needs anyway" would hold for no
+  // device onboarded by transfer (task 18). Caching ciphertext is safe by construction (same
+  // §5.3): it is never decryptable without the passphrase, which is never stored.
+  //
+  // Written after the decrypt, not before: a `vault.age` this passphrase cannot open is not
+  // something to cache as this device's vault -- the decrypt is the only evidence available here
+  // that the fetched bytes are the right file at all.
+  await local.putCachedVault({ armored: head.armored, sha: head.sha })
+
   return { text, baseSha: head.sha, token, identity, passphrase: resolved }
 }

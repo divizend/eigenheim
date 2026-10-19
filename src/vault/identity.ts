@@ -16,6 +16,16 @@ export async function generateDeviceIdentity(): Promise<{ identity: string; reci
   return { identity, recipient }
 }
 
+/** Derives the recipient (public key) of an identity this session already holds unwrapped --
+ * what {@link encryptToRecipient} needs to write `draft.age`/`token.age`. {@link Session}
+ * (src/session/unlock.ts) carries only the private identity, because that is the half every
+ * *read* needs; the editor's autosave is the first writer that needs the public half back
+ * (src/ui/editor.ts). Exists so `age-encryption` stays imported by src/vault/ alone -- `grep -rln
+ * 'from "age-encryption"' src/` reports exactly src/vault/crypto.ts and src/vault/identity.ts. */
+export async function recipientFor(identity: string): Promise<string> {
+  return identityToRecipient(identity)
+}
+
 /** Wraps an X25519 identity under a passphrase using the same encryption as
  * {@link encryptVault}, so the wrapped form (`device.age`) is protected to the
  * same standard as the vault itself (spec §5.3). */

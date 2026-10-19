@@ -235,7 +235,12 @@ test.describe("setup wizard", () => {
 
     await page.getByRole("button", { name: /create my vault/i }).click()
 
-    await expect(page.getByTestId("editor-placeholder")).toBeVisible({ timeout: 10_000 })
+    // Task 14 replaced the placeholder this used to assert on with the real editor, so the
+    // handoff is now checked by the thing it hands off TO: an empty vault opens an empty
+    // document, which is also the only end-to-end evidence that the text encrypted at step 6 and
+    // the text the editor mounts on are the same value.
+    await expect(page.getByTestId("editor")).toBeVisible({ timeout: 10_000 })
+    await expect(page.getByTestId("editor")).toHaveValue("")
 
     // "creates the data branch": the real orphan-branch creation sequence actually ran, not just
     // that the UI moved on.

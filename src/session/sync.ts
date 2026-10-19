@@ -164,8 +164,15 @@ export async function syncFromRemote(
  * exist (a decrypt bug, a passphrase mismatch after some future feature) -- which is exactly why
  * `attemptWrite` below only ever consults this around the single, narrow `store.write` call, not
  * around its own conflict-resolution follow-ups, where a `TypeError` would mean something else
- * entirely. */
-function isUnreachable(err: unknown): boolean {
+ * entirely.
+ *
+ * Exported (task 14) so the editor view classifies a failed BACKGROUND SYNC the same way --
+ * {@link syncFromRemote}'s only network call is one `store.readHead()`, the same single narrow
+ * call this test is sound around, and the alternative was a second copy of this predicate
+ * drifting from the reasoning above. Still not for general use: a `TypeError` arising anywhere
+ * other than around one specific `fetch`-backed call means something else, and this function
+ * cannot tell the difference. */
+export function isUnreachable(err: unknown): boolean {
   return err instanceof TypeError
 }
 
