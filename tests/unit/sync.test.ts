@@ -673,10 +673,14 @@ test("the queue can drain multiple entries in one call as independent commits wh
 })
 
 test("replay stops at the first conflict, leaving any later queued entries untouched for a future call", async () => {
-  // Explicit 20s timeout (vitest's default is 5s). This whole test body -- setup, replay, AND
-  // its own closing assertion -- runs TEN sequential logN=17 scrypt operations, never
-  // concurrently (this project's own Global Constraint, spec §5.4), and that is essentially the
-  // entirety of its wall clock.
+  // This is the suite's single heaviest test, and the one vite.config.ts's `testTimeout` is
+  // sized from: this whole test body -- setup, replay, AND its own closing assertion -- runs TEN
+  // sequential logN=17 scrypt operations, never concurrently (this project's own Global
+  // Constraint, spec §5.4), and that is essentially the entirety of its wall clock. The op count
+  // is this test's own property and lives here; the per-op cost and the chosen timeout are
+  // suite-wide and live there (ruling R31 -- the override this test used to carry inline was
+  // removed when that global was added, because every other scrypt-heavy test in this suite was
+  // one contention spike from needing an identical one).
   //
   // Ten is MEASURED, not counted by reading the call sites: a temporary stack-logging probe
   // wrapped around encryptVault/decryptVault in src/vault/crypto.ts, run against this single
@@ -691,18 +695,9 @@ test("replay stops at the first conflict, leaving any later queued entries untou
   // assertion rather than in the code under test, so a count scoped to "setup plus replay" misses
   // it -- while the ~0.5s it costs is exactly the kind of wall clock this timeout exists to
   // cover. Hence the deliberately unscoped framing above: the number and the covered wall clock
-  // have to be the same thing. Re-measure the same way before editing this number again.
+  // have to be the same thing. Re-measure the same way before editing this number again, and
+  // tell vite.config.ts if it changes -- that is where ten ops gets turned into a timeout.
   //
-  // Why 20s and not 5s: three consecutive runs of this single test on this box measured 4.94s,
-  // 5.07s and 4.96s -- straddling vitest's 5s default (ten ops over ~5s is ~0.5s each, in line
-  // with spec §5.4's own measured 407 ms encrypt / 402 ms decrypt). This box's CPU is a shared,
-  // cgroup-throttled quota (confirmed live again here: `cat /sys/fs/cgroup/cpu.max` reports
-  // `1200000 100000`, a 12-core quota against `nproc`'s 16, and `cpu.stat` shows nr_throttled
-  // 1392 / throttled_usec 256723616, both nonzero), so contention from other concurrent sessions
-  // pushes that over the line with nothing about this test's own logic being wrong -- which is
-  // what commit 2824951 established when the timeout was first raised, by rerunning the
-  // identical test with only `--testTimeout=20000` changed and no assertion touched. 20s leaves
-  // wide margin over the ~5s this actually costs even while throttled.
   // The ordinary multi-entry shape: all three entries share the identical original base (the
   // realistic case for one offline episode -- nothing succeeded in between to advance any of
   // them). "A" fast-forwards cleanly; that is exactly what makes "B" (same base) stale the
@@ -745,7 +740,7 @@ test("replay stops at the first conflict, leaving any later queued entries untou
   const remaining = await local.getPendingCommits()
   expect(remaining.length).toBe(1)
   expect(await decryptVault(remaining[0].armored, PASS)).toBe("C\n")
-}, 20_000)
+})
 
 test("a single still-unreachable replay attempt returns a structured outcome without throwing, and records the attempt", async () => {
   const local = new LocalStore()

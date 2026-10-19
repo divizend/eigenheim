@@ -91,6 +91,36 @@
   color: inherit;
 }
 
+/* A recovery button appended INSIDE a feedback panel -- step 3's "Check again" and step 6's
+   "Enter a different token" (ruling R30). Re-review NEW-5: both were rendering as unstyled
+   system-default buttons, because `.wizard-actions button` below is scoped to that container and
+   a feedback panel is not one. The effect was backwards and user-visible -- in the step-6
+   token-failure state the small grey default button was the only thing that could actually fix
+   the problem, sitting above a fully styled accent "Create my vault" that could only fail again.
+   Spec §13 asks for a visible way forward, and an affordance that reads as less real than the
+   dead end next to it is not visibly a way forward.
+
+   Deliberately NOT a reuse of `.wizard-actions button`'s own declarations: that rule fills with
+   `--accent-bg`, which is also `.wizard-feedback`'s own background, so an inherited style would
+   render as a flat, borderless patch on an identically-tinted panel. Filling with `--bg` and
+   taking the border as the always-visible edge instead keeps it legible inside the panel, and
+   both halves are theme variables, so this holds in the dark-mode block of src/style.css too. */
+.wizard-feedback button {
+  font-family: var(--sans);
+  font-size: 15px;
+  padding: 8px 16px;
+  margin-top: 10px;
+  border-radius: 6px;
+  border: 2px solid var(--accent-border);
+  background: var(--bg);
+  color: var(--accent);
+  cursor: pointer;
+}
+
+.wizard-feedback button:hover {
+  border-color: var(--accent);
+}
+
 .wizard-sheet {
   border: 1px solid var(--border);
   border-radius: 8px;

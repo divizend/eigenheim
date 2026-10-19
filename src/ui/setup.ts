@@ -292,9 +292,13 @@ export function errorRecoveryHtml(err: unknown): string {
  * recovery key, no reset, ever). Making the wizard re-entrant is the point, not a side effect:
  * six more UI tasks follow this file's structure.
  *
- * A separate exported function rather than two lines inline, for ruling R28's reason -- it is the
- * whole of the decision, it is pure, and tests/unit/setup.test.ts can therefore pin it without a
- * browser. */
+ * A separate exported function rather than two lines inline, for ruling R28's reason: it is the
+ * whole of the decision, it needs no DOM, and tests/unit/setup.test.ts can therefore pin both of
+ * its branches without a browser. Deliberately NOT described as pure (re-review NEW-3 corrected
+ * exactly that word here): the `generate` branch draws from `crypto.getRandomValues` via
+ * `generatePassphrase`, so it returns something different on every call -- which is why the test
+ * for that branch asserts the result is a valid fresh passphrase rather than any fixed value. The
+ * `existing` branch is the only deterministic one. */
 export function prefillPassphrase(existing: string): string {
   return existing.length > 0 ? existing : generatePassphrase()
 }

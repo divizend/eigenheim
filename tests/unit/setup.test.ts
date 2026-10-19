@@ -224,6 +224,19 @@ test("errorRecoveryHtml's TokenError branch carries the message and a create-tok
   // is a real affordance (the #retoken-btn this branch's own catch appends), not copy pointing at
   // absent markup, so this phrasing must stay step-neutral.
   expect(html).not.toMatch(/steps above/i)
+
+  // Re-review NEW-2: the two assertions below pin the copy this branch WRITES, not just the copy
+  // it no longer says. Fix round 2 replaced the positional phrasing above with a concrete
+  // instruction and pinned only the removal, so two regressions shipped green across the whole
+  // suite: naming "Contents: Read-only" -- the exact permission whose absence causes the very
+  // error being displayed, i.e. advice that guarantees a second failure -- and dropping the
+  // repo coordinates, leaving the reader to guess which of their repositories to scope the token
+  // to. Both are the same class as the positional reference: a confidently-worded instruction
+  // that is wrong. The permission string is not arbitrary either -- spec §6.7 requires exactly
+  // `Contents: Read and write` (GitHub forces `Metadata: Read` alongside it, which is why the
+  // copy deliberately does not mention Metadata: the user cannot choose it independently).
+  expect(html).toContain("Contents: Read and write")
+  expect(html).toContain(`${repoOwner()}/${repoSlug()}`)
 })
 
 test("errorRecoveryHtml's fallback branch shows an unrecognised error's own message, with no link", () => {
@@ -247,9 +260,23 @@ test("errorRecoveryHtml escapes HTML-significant characters in every branch", ()
   // before this test.
   // `&`, `<` and `>` only -- deliberately not quotes. Every message this function interpolates
   // lands in text-node position (inside a `<p>`), never inside an attribute value, so those three
-  // are exactly the sufficient set; the only attribute interpolations in this file are a module
-  // constant and build-time `define` values. A future call site that put an error message into an
-  // attribute would need quote escaping too, and would be wrong to rely on this function as-is.
+  // are exactly the sufficient set for the positions these values actually land in.
+  //
+  // Re-review NEW-4 corrected the claim that used to sit here, which asserted the only attribute
+  // interpolations were "a module constant and build-time `define` values" -- an exhaustiveness
+  // claim reached by reading rather than by grepping, and wrong. `grep -n '="\${' src/ui/setup.ts`
+  // returns FOUR lines, not three: 165 and 270 (`TOKEN_CREATE_URL`, a module constant), 263
+  // (`settingsUrl`, built from `repoOwner()`/`repoSlug()`, which are build-time `define` values),
+  // and 80 -- `aria-label="${title}"`, a plain function parameter the old claim did not cover.
+  // Harmless today, because all six `shell()` call sites pass a hardcoded literal title, and no
+  // error-derived string reaches it. Stated precisely because ruling R32 requires an
+  // exhaustiveness claim to carry the command that establishes it, this task having already
+  // produced four comments that were confidently wrong about a count or a set.
+  //
+  // What the escaping above does NOT cover: every error-derived value lands in text-node
+  // position inside a `<p>`, never inside an attribute, so `escapeHtml` omitting `"` and `'` is
+  // correct here and only here. A future call site that put an error message into an attribute
+  // would need quote escaping too, and would be wrong to rely on this function as-is.
   const nasty = "<script>alert(1)</script> & <b>bold</b>"
   for (const err of [new RepoPublicError(nasty), new TokenError(nasty), new Error(nasty), nasty]) {
     const html = errorRecoveryHtml(err)
