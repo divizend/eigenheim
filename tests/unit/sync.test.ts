@@ -1,7 +1,14 @@
 import "fake-indexeddb/auto"
-import { syncFromRemote, commit, replayPendingCommit, type Conflict } from "../../src/session/sync"
+import {
+  syncFromRemote,
+  commit,
+  replayPendingCommits,
+  ReplayRepeatedlyUnreachableError,
+  MAX_REPLAY_ATTEMPTS,
+  type Conflict,
+} from "../../src/session/sync"
 import type { Session } from "../../src/session/unlock"
-import { LocalStore } from "../../src/store/local"
+import { LocalStore, MAX_PENDING_COMMITS, PendingQueueFullError } from "../../src/store/local"
 import { GithubStore } from "../../src/store/github"
 import { encryptVault, decryptVault } from "../../src/vault/crypto"
 import { VAULT_PATH, DATA_BRANCH } from "../../src/config"
@@ -12,7 +19,7 @@ const REPO = "r"
 
 // fake-indexeddb's `indexedDB` is one global for the whole process (same reasoning as
 // tests/unit/local.test.ts's own beforeEach) -- without resetting it, one test's seeded
-// draft/cachedVault/pendingCommit would leak into the next.
+// draft/cachedVault/pendingCommits would leak into the next.
 beforeEach(async () => {
   await new LocalStore().clear()
 })
@@ -41,9 +48,11 @@ interface FixtureResponse {
  * unlock.test.ts's own recordingFetch: throws loudly on an unregistered call (so a bug that
  * makes this code hit an unexpected endpoint fails with a clear message), answers from
  * `responses`, and -- extended the way github-write.test.ts's own version is -- tolerates an
- * *array* of responses per key, consumed in order and holding the last entry once exhausted.
- * Duplicated rather than imported, matching this project's existing test-helper convention
- * (e.g. github-setup.test.ts's own makeBodyOf comment): each test file is self-contained. */
+ * *array* of responses per key, consumed in order and holding the last entry once exhausted
+ * (what drives this file's own "sequential replies for the same endpoint across two write
+ * attempts" tests below). Duplicated rather than imported, matching this project's existing
+ * test-helper convention (e.g. github-setup.test.ts's own makeBodyOf comment): each test file
+ * is self-contained. */
 function recordingFetch(
   calls: string[],
   responses: Record<string, FixtureResponse | FixtureResponse[]>,
@@ -72,9 +81,9 @@ function recordingFetch(
  * 24 runtime (`node -e 'fetch("http://<bogus host>.invalid/")'`) that a real network-level
  * failure rejects with a plain `TypeError` ("fetch failed", `.cause` the underlying
  * `ENOTFOUND`), never one of GithubStore's own named error classes (src/store/errors.ts). This
- * is what src/session/sync.ts's `commit` treats as "offline" -- not `navigator.onLine`, so
- * this test needs no injected event or timer at all (task brief: "if your offline test needs
- * an online event or a timer, inject it" -- this design needs neither, see the report). */
+ * is what src/session/sync.ts's `isUnreachable` treats as "offline" -- not `navigator.onLine`,
+ * so this test needs no injected event or timer at all (task brief: "if your offline test
+ * needs an online event or a timer, inject it" -- this design needs neither, see the report). */
 function fetchThatIsOffline(): typeof fetch {
   return (async () => {
     throw new TypeError("fetch failed")
@@ -225,7 +234,7 @@ test("offline commits queue and replay in order on reconnect", async () => {
   // spec §13 -- "editing continues; commit queues and retries on reconnect". No real timer or
   // `online` event anywhere in this test: "offline" is simulated by a fetch that throws
   // (fetchThatIsOffline, see its own doc comment for why that's the right signal), and
-  // "reconnect" is simulated by simply calling replayPendingCommit with a GithubStore whose
+  // "reconnect" is simulated by simply calling replayPendingCommits with a GithubStore whose
   // fetch actually answers -- both are plain, deterministic function calls.
   const local = new LocalStore()
   const session = makeSession({ baseSha: "sha-v0", text: "v0\n" })
@@ -235,10 +244,10 @@ test("offline commits queue and replay in order on reconnect", async () => {
   const queued = await commit(session, "offline edit\n", offlineStore, local)
   expect(queued).toEqual({ queued: true })
 
-  const pending = await local.getPendingCommit()
-  expect(pending).not.toBeNull()
-  expect(pending!.baseSha).toBe("sha-v0")
-  expect(await decryptVault(pending!.armored, PASS)).toBe("offline edit\n")
+  const queue = await local.getPendingCommits()
+  expect(queue.length).toBe(1)
+  expect(queue[0].baseSha).toBe("sha-v0")
+  expect(await decryptVault(queue[0].armored, PASS)).toBe("offline edit\n")
   // Queuing alone never commits anything -- no network call succeeded, so nothing durable
   // changed yet.
   expect(await local.getCachedVault()).toBeNull()
@@ -250,12 +259,12 @@ test("offline commits queue and replay in order on reconnect", async () => {
   // against a store that can actually reach GitHub now just succeeds.
   const calls: string[] = []
   const onlineStore = new GithubStore({ owner: OWNER, repo: REPO, token: "t", fetch: recordingFetch(calls, writeFixtures("reconnect-commit")) })
-  const replayed = await replayPendingCommit(session, onlineStore, local)
+  const replayed = await replayPendingCommits(session, onlineStore, local)
 
-  expect(replayed).toEqual({ sha: "reconnect-commit" })
-  expect(await local.getPendingCommit()).toBeNull()
+  expect(replayed).toEqual({ committedShas: ["reconnect-commit"], conflict: null, unreachable: false })
+  expect(await local.getPendingCommits()).toEqual([])
   expect(await local.getDraft()).toBeNull()
-  expect(await local.getCachedVault()).toEqual({ armored: pending!.armored, sha: "reconnect-commit" })
+  expect(await local.getCachedVault()).toEqual({ armored: queue[0].armored, sha: "reconnect-commit" })
   expect(session.baseSha).toBe("reconnect-commit")
   expect(session.text).toBe("offline edit\n")
 })
@@ -311,23 +320,12 @@ test("the merge base is the draft's own baseSha, not the session's, when the two
   expect((r as { conflict: Conflict }).conflict).toMatchObject({ base: "v0\n", mine: "mine\n", theirs: "v1\n" })
 })
 
-test("a second offline commit supersedes the first -- the queue never holds more than one", async () => {
-  const local = new LocalStore()
-  const session = makeSession({ baseSha: "sha-v0", text: "v0\n" })
-  const offlineStore = new GithubStore({ owner: OWNER, repo: REPO, token: "t", fetch: fetchThatIsOffline() })
-
-  await commit(session, "first offline edit\n", offlineStore, local)
-  await commit(session, "second offline edit\n", offlineStore, local)
-
-  const pending = await local.getPendingCommit()
-  expect(await decryptVault(pending!.armored, PASS)).toBe("second offline edit\n")
-})
-
 test("a named GithubStore error (not a network failure) propagates instead of being queued", async () => {
-  // isUnreachable's whole point: only a failure with none of GithubStore's own named classes
-  // means "couldn't reach GitHub at all". A public repo is a real, named, non-transient
-  // condition (RepoPublicError) with its own recovery affordance (spec §13) -- queuing it for
-  // a silent retry would be actively wrong, since retrying can never fix it.
+  // isUnreachable's whole point: only a genuine network-level failure (a real TypeError) means
+  // "couldn't reach GitHub at all". A public repo is a real, named, non-transient condition
+  // (RepoPublicError, a plain Error subclass -- never a TypeError) with its own recovery
+  // affordance (spec §13) -- queuing it for a silent retry would be actively wrong, since
+  // retrying can never fix it.
   const local = new LocalStore()
   const session = makeSession({ baseSha: "sha-v0", text: "v0\n" })
   const store = new GithubStore({
@@ -338,63 +336,44 @@ test("a named GithubStore error (not a network failure) propagates instead of be
   })
 
   await expect(commit(session, "mine\n", store, local)).rejects.toThrow(/private/)
-  expect(await local.getPendingCommit()).toBeNull()
+  expect(await local.getPendingCommits()).toEqual([])
 })
 
-test("replaying a queued commit that conflicts clears the queue and never retries it verbatim", async () => {
+test("a genuine unmapped GitHub HTTP error propagates immediately instead of being silently queued forever", async () => {
+  // Review round 1, Important 3: a transient 500 (or any status GithubStore's own request()
+  // doesn't specifically map) is a REAL response GitHub sent -- request()'s generic fallback
+  // turns it into a plain, unclassified `Error`, never a `TypeError`. The original
+  // exclusion-based isUnreachable ("not one of the six named classes") would have misclassified
+  // this as "offline" and queued it, where it would fail identically -- and silently -- on
+  // every future replay, with no diagnostic. The fixed, positive `instanceof TypeError` test
+  // tells the two apart.
   const local = new LocalStore()
   const session = makeSession({ baseSha: "sha-v0", text: "v0\n" })
-  const queuedArmored = await encryptVault("queued edit\n", PASS)
-  await local.putPendingCommit({ armored: queuedArmored, baseSha: "sha-v0", message: "save" })
-  const baseArmored = await encryptVault("v0\n", PASS)
-  const theirsArmored = await encryptVault("someone else's v1\n", PASS)
-  const store = storeRejectingWrite({
-    ...readHeadFixtures(theirsArmored, "sha-v1"),
-    ...commitTreeBlobFixtures(baseArmored, "sha-v0"),
-  })
+  const responses: Record<string, FixtureResponse> = {
+    [`GET ${repoPath("")}`]: { status: 200, body: { private: true, permissions: { push: true } } },
+    [`POST ${repoPath("/git/blobs")}`]: { status: 201, body: { sha: "b" } },
+    [`POST ${repoPath("/git/trees")}`]: { status: 201, body: { sha: "t" } },
+    [`POST ${repoPath("/git/commits")}`]: { status: 201, body: { sha: "c" } },
+    [`PATCH ${repoPath(`/git/refs/heads/${DATA_BRANCH}`)}`]: { status: 500, body: { message: "Internal Server Error" } },
+  }
+  const store = new GithubStore({ owner: OWNER, repo: REPO, token: "t", fetch: recordingFetch([], responses) })
 
-  const r = await replayPendingCommit(session, store, local)
-
-  expect(r).not.toBeNull()
-  expect("conflict" in r!).toBe(true)
-  expect((r as { conflict: Conflict }).conflict).toMatchObject({
-    base: "v0\n",
-    mine: "queued edit\n",
-    theirs: "someone else's v1\n",
-  })
-  // "a real answer, not a transient failure" (task brief) -- cleared, not left to be replayed
-  // verbatim against the same now-stale base on a later reconnect.
-  expect(await local.getPendingCommit()).toBeNull()
-})
-
-test("replaying while still unreachable rejects and leaves the commit queued", async () => {
-  // The mirror image of the conflict case above: here the retry itself still can't reach
-  // GitHub at all, so nothing has been resolved -- the pending commit must survive for a
-  // future reconnect to try again, which it can only do if this rejects rather than silently
-  // returning something that looks like "handled".
-  const local = new LocalStore()
-  const session = makeSession({ baseSha: "sha-v0", text: "v0\n" })
-  const queuedArmored = await encryptVault("queued edit\n", PASS)
-  await local.putPendingCommit({ armored: queuedArmored, baseSha: "sha-v0", message: "save" })
-  const store = new GithubStore({ owner: OWNER, repo: REPO, token: "t", fetch: fetchThatIsOffline() })
-
-  await expect(replayPendingCommit(session, store, local)).rejects.toThrow()
-
-  expect(await local.getPendingCommit()).not.toBeNull()
+  await expect(commit(session, "mine\n", store, local)).rejects.toThrow()
+  expect(await local.getPendingCommits()).toEqual([])
 })
 
 test("a failure fetching 'theirs' during conflict resolution propagates raw, never silently queued", async () => {
-  // Self-review catch: a first cut of attemptWrite classified ANY error reaching its single
-  // catch block -- including one from the conflict-resolution follow-up calls, not just the
-  // initial store.write -- with the same isUnreachable check used to decide "queue this".
-  // isUnreachable cannot distinguish "the initial write never reached GitHub" from "GitHub was
-  // reached, said StaleWriteError, and THEN a later call failed for some unrelated reason" --
-  // both look identical from the outside (neither is one of ALL_ERROR_CLASSES). Silently
-  // queuing the latter would retry stale content against a base already known to be wrong,
-  // instead of surfacing whatever the real, different problem was. This fixture deliberately
-  // makes the ref-update fail as a genuine StaleWriteError (so GitHub really was reached), and
-  // ONLY THEN makes the very next call (readHead's own ref-GET) throw a network-shaped error --
-  // proving the two are told apart, not conflated.
+  // Self-review catch (original implementation): a first cut of attemptWrite classified ANY
+  // error reaching its single catch block -- including one from the conflict-resolution
+  // follow-up calls, not just the initial store.write -- with the same isUnreachable check used
+  // to decide "queue this". isUnreachable cannot distinguish "the initial write never reached
+  // GitHub" from "GitHub was reached, said StaleWriteError, and THEN a later call failed for
+  // some unrelated reason" if both happen to be TypeErrors. Silently queuing the latter would
+  // retry stale content against a base already known to be wrong, instead of surfacing whatever
+  // the real, different problem was. This fixture deliberately makes the ref-update fail as a
+  // genuine StaleWriteError (so GitHub really was reached), and ONLY THEN makes the very next
+  // call (readHead's own ref-GET) throw a network-shaped error -- proving the two are told
+  // apart, not conflated.
   const local = new LocalStore()
   const session = makeSession({ baseSha: "sha-v0", text: "v0\n" })
   const responses: Record<string, FixtureResponse> = {
@@ -422,34 +401,15 @@ test("a failure fetching 'theirs' during conflict resolution propagates raw, nev
 
   await expect(commit(session, "mine\n", store, local)).rejects.toThrow(TypeError)
   // NOT queued -- the whole point: this is a different failure than "never reached GitHub".
-  expect(await local.getPendingCommit()).toBeNull()
+  expect(await local.getPendingCommits()).toEqual([])
 })
 
-test("a later successful direct commit clears a stale queued commit nobody ever replayed", async () => {
-  // A real sequence, not contrived: offline, edit, Ctrl+S queues a commit; back online before
-  // any reconnect-replay ran; user edits again and hits Ctrl+S, which goes straight through
-  // (attemptWrite's own success path, not replayPendingCommit). The now-superseded queued
-  // attempt -- built on the same baseSha, carrying strictly older content -- must not survive
-  // to be replayed later against a base that's now stale, reproducing a conflict about content
-  // the user already re-saved successfully.
-  const local = new LocalStore()
-  const session = makeSession({ baseSha: "sha-v0", text: "v0\n" })
-  const staleQueuedArmored = await encryptVault("never-replayed offline edit\n", PASS)
-  await local.putPendingCommit({ armored: staleQueuedArmored, baseSha: "sha-v0", message: "save" })
-  const store = new GithubStore({ owner: OWNER, repo: REPO, token: "t", fetch: recordingFetch([], writeFixtures("direct-commit")) })
-
-  const r = await commit(session, "v1, saved directly while online\n", store, local)
-
-  expect(r).toEqual({ sha: "direct-commit" })
-  expect(await local.getPendingCommit()).toBeNull()
-})
-
-test("replayPendingCommit is a no-op returning null when nothing is queued", async () => {
+test("replayPendingCommits is a no-op returning null when nothing is queued", async () => {
   const local = new LocalStore()
   const session = makeSession()
   const store = new GithubStore({ owner: OWNER, repo: REPO, token: "t", fetch: recordingFetch([], {}) })
 
-  expect(await replayPendingCommit(session, store, local)).toBeNull()
+  expect(await replayPendingCommits(session, store, local)).toBeNull()
 })
 
 test("syncFromRemote makes no decrypt call at all when nothing has changed", async () => {
@@ -511,4 +471,291 @@ test("the conflict path never runs its scrypt-protected decrypts concurrently", 
     proto.decrypt = original
   }
   expect(peak).toBe(1)
+})
+
+// ---------------------------------------------------------------------------
+// Review round 1 fixes -- two Criticals and an Important, each reproduced live against this
+// file's own pre-fix code before being fixed (see this task's fix report for the RED output).
+// The tests below assert the FIXED, correct behaviour; each replaces an earlier test that
+// asserted what turned out to be the bug itself (named in each comment below).
+// ---------------------------------------------------------------------------
+
+test("two tabs independently queuing offline commits from the same base must not destroy each other", async () => {
+  // Critical 1. Two INDEPENDENT Session objects -- not the same object called twice. That
+  // distinction is exactly what let this bug through the first time: the original "a second
+  // offline commit supersedes the first" test (removed) used one Session for both calls,
+  // modeling one continuous editing stream, never two tabs that each went offline from the
+  // same base without ever seeing the other's edit.
+  const local = new LocalStore()
+  const sessionTab1 = makeSession({ baseSha: "sha-v0", text: "v0\n" })
+  const sessionTab2 = makeSession({ baseSha: "sha-v0", text: "v0\n" })
+  const offlineStore = new GithubStore({ owner: OWNER, repo: REPO, token: "t", fetch: fetchThatIsOffline() })
+
+  await commit(sessionTab1, "A\n", offlineStore, local)
+  await commit(sessionTab2, "B\n", offlineStore, local)
+
+  const queue = await local.getPendingCommits()
+  expect(queue.length).toBe(2)
+  expect(await decryptVault(queue[0].armored, PASS)).toBe("A\n")
+  expect(await decryptVault(queue[1].armored, PASS)).toBe("B\n")
+})
+
+test("two consecutive offline commits from the same session also both queue, in order -- never superseded", async () => {
+  // The complementary, same-tab case: even a single continuous editing stream's own two
+  // offline saves both queue (every commit already carries the full text, so there would be no
+  // CORRECTNESS reason to drop the first -- but review round 1 established that dropping it is
+  // also not SAFE in general, so the uniform rule is simply: enqueue always appends).
+  const local = new LocalStore()
+  const session = makeSession({ baseSha: "sha-v0", text: "v0\n" })
+  const offlineStore = new GithubStore({ owner: OWNER, repo: REPO, token: "t", fetch: fetchThatIsOffline() })
+
+  await commit(session, "first offline edit\n", offlineStore, local)
+  await commit(session, "second offline edit\n", offlineStore, local)
+
+  const queue = await local.getPendingCommits()
+  expect(queue.length).toBe(2)
+  expect(await decryptVault(queue[0].armored, PASS)).toBe("first offline edit\n")
+  expect(await decryptVault(queue[1].armored, PASS)).toBe("second offline edit\n")
+})
+
+test("enqueuing beyond the cap during commit() propagates PendingQueueFullError, and the edit survives in the draft", async () => {
+  const local = new LocalStore()
+  const session = makeSession({ baseSha: "sha-v0", text: "v0\n" })
+  await local.putDraft({ armored: "draft-at-start", baseSha: "sha-v0", savedAt: 1000 })
+  for (let i = 0; i < MAX_PENDING_COMMITS; i++) {
+    await local.enqueuePendingCommit({ armored: `filler-${i}`, baseSha: "sha-v0", message: "m" })
+  }
+  const offlineStore = new GithubStore({ owner: OWNER, repo: REPO, token: "t", fetch: fetchThatIsOffline() })
+
+  await expect(commit(session, "one too many\n", offlineStore, local)).rejects.toThrow(PendingQueueFullError)
+
+  // The edit is not lost -- it is still sitting in the draft (commit() only touches the draft
+  // on a successful write, which this was not).
+  expect(await local.getDraft()).not.toBeNull()
+})
+
+test("a newer draft written while a commit is in flight survives, rebased onto the just-committed sha, instead of being destroyed", async () => {
+  // Critical 2. Models the real race: commit() reads the draft, then spends real time (scrypt
+  // plus a network round trip) before its write resolves. Injected here as a side effect of
+  // the fetch mock's very first call (the blob POST), landing a NEWER draft mid-write --
+  // deterministic, no real timing or concurrency needed, matching this project's injection
+  // discipline.
+  const local = new LocalStore()
+  const session = makeSession({ baseSha: "sha-v0", text: "v0\n" })
+  await local.putDraft({ armored: "draft-at-start", baseSha: "sha-v0", savedAt: 1000 })
+
+  const fixtures = writeFixtures("in-flight-commit")
+  const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const urlStr = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+    const { pathname, search } = new URL(urlStr)
+    const method = init?.method ?? "GET"
+    const key = `${method} ${pathname}${search}`
+    if (key === `POST ${repoPath("/git/blobs")}`) {
+      await local.putDraft({ armored: "draft-written-during-the-write", baseSha: "sha-v0", savedAt: 9999 })
+    }
+    const fixture = fixtures[key]
+    if (!fixture) throw new Error(`no fixture response for ${key}`)
+    return new Response(JSON.stringify(fixture.body), {
+      status: fixture.status,
+      headers: { "content-type": "application/json" },
+    })
+  }) as typeof fetch
+  const store = new GithubStore({ owner: OWNER, repo: REPO, token: "t", fetch: fetchFn })
+
+  await commit(session, "v1\n", store, local)
+
+  const draftAfter = await local.getDraft()
+  expect(draftAfter).not.toBeNull()
+  expect(draftAfter?.armored).toBe("draft-written-during-the-write")
+  // Rebased onto the sha just committed -- not left pointing at the now-stale original base.
+  expect(draftAfter?.baseSha).toBe("in-flight-commit")
+})
+
+test("a later successful direct commit does not destroy a stale queued entry -- replaying it still safely surfaces as a conflict", async () => {
+  // Replaces the original "a later successful direct commit clears a stale queued commit
+  // nobody ever replayed" test, which asserted the OPPOSITE of what review round 1 established
+  // is safe: "the newer save already supersedes whatever was queued" is exactly the unverified
+  // "these two must be equivalent" assumption that Critical 1 proved false for two tabs sharing
+  // a base. The safe answer is to never guess -- leave the stale entry queued, and let its own
+  // eventual replay discover, via a real three-way merge, whether it is actually superseded or
+  // genuinely independent content.
+  const local = new LocalStore()
+  const session = makeSession({ baseSha: "sha-v0", text: "v0\n" })
+  const staleQueuedArmored = await encryptVault("never-replayed offline edit\n", PASS)
+  await local.enqueuePendingCommit({ armored: staleQueuedArmored, baseSha: "sha-v0", message: "save" })
+  const store = new GithubStore({ owner: OWNER, repo: REPO, token: "t", fetch: recordingFetch([], writeFixtures("direct-commit")) })
+
+  const r = await commit(session, "v1, saved directly while online\n", store, local)
+  expect(r).toEqual({ sha: "direct-commit" })
+
+  // The stale entry is untouched by this unrelated success.
+  const queueAfter = await local.getPendingCommits()
+  expect(queueAfter.length).toBe(1)
+  expect(await decryptVault(queueAfter[0].armored, PASS)).toBe("never-replayed offline edit\n")
+
+  // Replaying it now safely surfaces as a conflict (its baseSha is stale against the direct
+  // commit that just happened), not silently vanishing and not wrongly applied.
+  const theirsArmored = await encryptVault("v1, saved directly while online\n", PASS)
+  const baseArmored = await encryptVault("v0\n", PASS)
+  const replayStore = storeRejectingWrite({
+    ...readHeadFixtures(theirsArmored, "direct-commit"),
+    ...commitTreeBlobFixtures(baseArmored, "sha-v0"),
+  })
+  const replayResult = await replayPendingCommits(session, replayStore, local)
+
+  expect(replayResult).not.toBeNull()
+  expect(replayResult!.conflict).toMatchObject({
+    base: "v0\n",
+    mine: "never-replayed offline edit\n",
+    theirs: "v1, saved directly while online\n",
+  })
+})
+
+test("replaying a queued commit that conflicts dequeues it and never retries it verbatim", async () => {
+  const local = new LocalStore()
+  const session = makeSession({ baseSha: "sha-v0", text: "v0\n" })
+  const queuedArmored = await encryptVault("queued edit\n", PASS)
+  await local.enqueuePendingCommit({ armored: queuedArmored, baseSha: "sha-v0", message: "save" })
+  const baseArmored = await encryptVault("v0\n", PASS)
+  const theirsArmored = await encryptVault("someone else's v1\n", PASS)
+  const store = storeRejectingWrite({
+    ...readHeadFixtures(theirsArmored, "sha-v1"),
+    ...commitTreeBlobFixtures(baseArmored, "sha-v0"),
+  })
+
+  const r = await replayPendingCommits(session, store, local)
+
+  expect(r).not.toBeNull()
+  expect(r!.committedShas).toEqual([])
+  expect(r!.unreachable).toBe(false)
+  expect(r!.conflict).toMatchObject({ base: "v0\n", mine: "queued edit\n", theirs: "someone else's v1\n" })
+  // "a real answer, not a transient failure" (task brief) -- dequeued, not left to be replayed
+  // verbatim against the same now-stale base on a later reconnect.
+  expect(await local.getPendingCommits()).toEqual([])
+})
+
+test("the queue can drain multiple entries in one call as independent commits when none of them conflict", async () => {
+  // Realistically, every entry queued during the SAME offline episode shares the identical
+  // original baseSha (nothing succeeded in between to advance it), so the second entry onward
+  // almost always hits a stale write on replay -- see the "stops at the first conflict" test
+  // below for that ordinary case. This test instead proves the LOOP ITSELF correctly keeps
+  // draining after a success (not just handling exactly one entry): it constructs a queue
+  // whose second entry's own baseSha is deliberately set to what the first entry is KNOWN (in
+  // this test, not in reality) to commit to -- an artificial setup no real offline user could
+  // arrange, since nobody knows their own future commit sha while still offline, but a faithful
+  // test of the loop's own control flow and of "N queued entries replay as N real commits"
+  // (review round 1's own ruling) in the one case where that is actually achievable in a single
+  // call.
+  const local = new LocalStore()
+  const session = makeSession({ baseSha: "sha-v0", text: "v0\n" })
+  await local.enqueuePendingCommit({ armored: await encryptVault("first\n", PASS), baseSha: "sha-v0", message: "m1" })
+  await local.enqueuePendingCommit({ armored: await encryptVault("second\n", PASS), baseSha: "commit-1", message: "m2" })
+
+  const store = new GithubStore({
+    owner: OWNER,
+    repo: REPO,
+    token: "t",
+    fetch: recordingFetch([], {
+      [`GET ${repoPath("")}`]: { status: 200, body: { private: true, permissions: { push: true } } },
+      [`POST ${repoPath("/git/blobs")}`]: { status: 201, body: { sha: "blob" } },
+      [`POST ${repoPath("/git/trees")}`]: { status: 201, body: { sha: "tree" } },
+      [`POST ${repoPath("/git/commits")}`]: [
+        { status: 201, body: { sha: "commit-1" } },
+        { status: 201, body: { sha: "commit-2" } },
+      ],
+      [`PATCH ${repoPath(`/git/refs/heads/${DATA_BRANCH}`)}`]: [
+        { status: 200, body: { ref: `refs/heads/${DATA_BRANCH}`, object: { sha: "commit-1" } } },
+        { status: 200, body: { ref: `refs/heads/${DATA_BRANCH}`, object: { sha: "commit-2" } } },
+      ],
+    }),
+  })
+
+  const result = await replayPendingCommits(session, store, local)
+
+  expect(result).toEqual({ committedShas: ["commit-1", "commit-2"], conflict: null, unreachable: false })
+  expect(await local.getPendingCommits()).toEqual([])
+  expect(session.baseSha).toBe("commit-2")
+  expect(session.text).toBe("second\n")
+})
+
+test("replay stops at the first conflict, leaving any later queued entries untouched for a future call", async () => {
+  // The ordinary multi-entry shape: all three entries share the identical original base (the
+  // realistic case for one offline episode -- nothing succeeded in between to advance any of
+  // them). "A" fast-forwards cleanly; that is exactly what makes "B" (same base) stale the
+  // instant "A" lands -- so "B" conflicts against "A"'s own just-written content. "C" is never
+  // even attempted.
+  const local = new LocalStore()
+  const session = makeSession({ baseSha: "sha-v0", text: "v0\n" })
+  await local.enqueuePendingCommit({ armored: await encryptVault("A\n", PASS), baseSha: "sha-v0", message: "m-a" })
+  await local.enqueuePendingCommit({ armored: await encryptVault("B\n", PASS), baseSha: "sha-v0", message: "m-b" })
+  await local.enqueuePendingCommit({ armored: await encryptVault("C\n", PASS), baseSha: "sha-v0", message: "m-c" })
+
+  const aArmored = await encryptVault("A\n", PASS)
+  const baseArmored = await encryptVault("v0\n", PASS)
+  const store = new GithubStore({
+    owner: OWNER,
+    repo: REPO,
+    token: "t",
+    fetch: recordingFetch([], {
+      [`GET ${repoPath("")}`]: { status: 200, body: { private: true, permissions: { push: true } } },
+      [`POST ${repoPath("/git/blobs")}`]: { status: 201, body: { sha: "blob" } },
+      [`POST ${repoPath("/git/trees")}`]: { status: 201, body: { sha: "tree" } },
+      [`POST ${repoPath("/git/commits")}`]: { status: 201, body: { sha: "A-sha" } },
+      [`PATCH ${repoPath(`/git/refs/heads/${DATA_BRANCH}`)}`]: [
+        { status: 200, body: { ref: `refs/heads/${DATA_BRANCH}`, object: { sha: "A-sha" } } },
+        { status: 422, body: { message: "not a fast forward" } },
+      ],
+      ...readHeadFixtures(aArmored, "A-sha"),
+      ...commitTreeBlobFixtures(baseArmored, "sha-v0"),
+    }),
+  })
+
+  const result = await replayPendingCommits(session, store, local)
+
+  expect(result).not.toBeNull()
+  expect(result!.committedShas).toEqual(["A-sha"])
+  expect(result!.unreachable).toBe(false)
+  expect(result!.conflict).toMatchObject({ base: "v0\n", mine: "B\n", theirs: "A\n" })
+
+  // "C" was never even attempted -- still queued, exactly as it was.
+  const remaining = await local.getPendingCommits()
+  expect(remaining.length).toBe(1)
+  expect(await decryptVault(remaining[0].armored, PASS)).toBe("C\n")
+})
+
+test("a single still-unreachable replay attempt returns a structured outcome without throwing, and records the attempt", async () => {
+  const local = new LocalStore()
+  const session = makeSession({ baseSha: "sha-v0", text: "v0\n" })
+  await local.enqueuePendingCommit({ armored: await encryptVault("queued\n", PASS), baseSha: "sha-v0", message: "m" })
+  const store = new GithubStore({ owner: OWNER, repo: REPO, token: "t", fetch: fetchThatIsOffline() })
+
+  const result = await replayPendingCommits(session, store, local)
+
+  expect(result).toEqual({ committedShas: [], conflict: null, unreachable: true })
+  const queue = await local.getPendingCommits()
+  expect(queue.length).toBe(1)
+  expect(queue[0].attempts).toBe(1)
+})
+
+test("repeated unreachable replays eventually throw ReplayRepeatedlyUnreachableError without ever discarding the entry", async () => {
+  // Review round 1, Important 3's own "cap identical repeated replay failures and surface a
+  // distinct error" requirement. MAX_REPLAY_ATTEMPTS - 1 calls return the ordinary structured
+  // "still unreachable" outcome (attempts climbing 1, 2, 3, 4); the MAX_REPLAY_ATTEMPTS-th call
+  // throws instead -- but the queue entry survives every single one of them.
+  const local = new LocalStore()
+  const session = makeSession({ baseSha: "sha-v0", text: "v0\n" })
+  await local.enqueuePendingCommit({ armored: await encryptVault("queued\n", PASS), baseSha: "sha-v0", message: "m" })
+  const store = new GithubStore({ owner: OWNER, repo: REPO, token: "t", fetch: fetchThatIsOffline() })
+
+  for (let i = 0; i < MAX_REPLAY_ATTEMPTS - 1; i++) {
+    const r = await replayPendingCommits(session, store, local)
+    expect(r).toEqual({ committedShas: [], conflict: null, unreachable: true })
+  }
+
+  await expect(replayPendingCommits(session, store, local)).rejects.toThrow(ReplayRepeatedlyUnreachableError)
+
+  const queue = await local.getPendingCommits()
+  expect(queue.length).toBe(1)
+  expect(queue[0].attempts).toBe(MAX_REPLAY_ATTEMPTS)
+  expect(await decryptVault(queue[0].armored, PASS)).toBe("queued\n")
 })

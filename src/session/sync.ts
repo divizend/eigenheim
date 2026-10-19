@@ -9,14 +9,30 @@
 // This file has no Node types available (tsconfig.app.json covers `src/`) and must stay that
 // way -- nothing here needs anything beyond plain JS/TS, so this is automatic, not a constraint
 // that took any work to satisfy.
+//
+// Review round 1 found two Criticals and an Important in this file's first version, both
+// Criticals reproduced live (not theorised) against a scratch copy of the project -- see this
+// task's fix report for the full detail. The short version, since it shapes several choices
+// below: (1) the original single-slot offline queue let a second tab's own queued commit
+// silently destroy a first tab's, when both diverged from the same base without ever seeing
+// each other's edit -- fixed by making the queue an append-only list, replayed oldest-first,
+// never coalesced. (2) a successful commit unconditionally deleted the draft, destroying any
+// newer draft an autosave had landed while the write was still in flight (0.4-2s of scrypt plus
+// a network round trip) -- fixed by capturing the draft's `savedAt` before the write starts and
+// only clearing if it is unchanged after, rebasing it onto the new commit otherwise. (3)
+// `isUnreachable` classified "GitHub could not be reached" by EXCLUSION (not one of
+// GithubStore's own named error classes) rather than by a positive test, so a genuine but
+// unmapped GitHub HTTP error (e.g. a transient 500) was misclassified as offline and queued
+// forever with no distinguishing diagnostic -- fixed by testing positively for a real network
+// failure (`TypeError`, confirmed empirically to be the actual shape `fetch` itself throws).
 
 import type { Session } from "./unlock"
 import type { GithubStore } from "../store/github"
-// `Draft`/`PendingCommit` are imported only so the doc comments below can `{@link}` them --
-// neither is written out as an explicit type annotation anywhere in this file, since every
-// local inferred from LocalStore's own getters already has the right shape.
-import type { LocalStore, Draft, PendingCommit } from "../store/local"
-import { StaleWriteError, ALL_ERROR_CLASSES } from "../store/errors"
+// `Draft` is imported only so the doc comments below can `{@link}` it -- it is never written
+// out as an explicit type annotation anywhere in this file, since every local inferred from
+// LocalStore's own getters already has the right shape.
+import type { LocalStore, Draft } from "../store/local"
+import { StaleWriteError } from "../store/errors"
 import { decryptVault, encryptVault } from "../vault/crypto"
 import { merge3 } from "../vault/merge"
 
@@ -42,6 +58,48 @@ export interface Conflict {
  * narrower union it destructures by hand; one that wants to show "saved, will sync when back
  * online" messaging switches on this third case explicitly. */
 export type CommitResult = { sha: string } | { conflict: Conflict } | { queued: true }
+
+/** `replayPendingCommits`' own result -- see that function's doc comment. `committedShas` lists
+ * every queued entry successfully written during this one call, oldest first (each is a real,
+ * independent commit -- review round 1's own ruling: "N queued entries replaying as N commits
+ * gives a truthful history", not one squashed commit). Processing stops at the first entry that
+ * either conflicts or finds GitHub unreachable again, leaving any later entries still queued
+ * for a future call -- at most one of `conflict`/`unreachable` is ever set. Both unset (and
+ * `committedShas` covering the whole queue) means every queued entry drained cleanly. */
+export interface ReplayOutcome {
+  committedShas: string[]
+  conflict: Conflict | null
+  unreachable: boolean
+}
+
+/** Bounded retry budget for a single queued entry repeatedly failing as unreachable across
+ * separate `replayPendingCommits` calls (e.g. one per `online` event, each one genuinely still
+ * offline) -- mirrors `GithubStore`'s own `MAX_RATE_LIMIT_RETRIES = 5` (src/store/github.ts),
+ * same "bounded, not forever" reasoning, same number for the same reason: generous enough that
+ * ordinary flaky reconnects recover silently, bounded enough that "still offline" eventually
+ * stops looking identical to "just reconnected a moment too soon" and says so instead (review
+ * round 1, Important 3's own "cap identical repeated replay failures and surface a distinct
+ * error" requirement). The entry itself is never discarded at the cap -- only
+ * {@link ReplayRepeatedlyUnreachableError} is thrown in its place of the usual silent
+ * `unreachable: true` outcome; the edit stays queued for whenever connectivity genuinely
+ * returns. */
+export const MAX_REPLAY_ATTEMPTS = 5
+
+/** Thrown by `replayPendingCommits` once the front entry has failed as unreachable
+ * {@link MAX_REPLAY_ATTEMPTS} times in a row -- see that constant's own doc comment. Distinct
+ * from the ordinary `{ unreachable: true }` outcome specifically so a UI can tell "routine,
+ * keep quietly retrying on the next reconnect" apart from "this has been failing for a while,
+ * say something" (review round 1, Important 3) -- without ever implying the edit itself was
+ * lost, which it is not: the queue entry survives this throw untouched. */
+export class ReplayRepeatedlyUnreachableError extends Error {
+  constructor(
+    message = `GitHub has been unreachable for ${MAX_REPLAY_ATTEMPTS} consecutive reconnect attempts -- the edit is still safely queued locally, but check your connection`,
+    options?: ErrorOptions,
+  ) {
+    super(message, options)
+    this.name = "ReplayRepeatedlyUnreachableError"
+  }
+}
 
 /** Compares this session's own `baseSha` -- "the commit SHA it was read at" (see `Session`'s
  * own doc comment in src/session/unlock.ts) -- against `data`'s current head (spec §5.3's
@@ -88,69 +146,90 @@ export async function syncFromRemote(
   return { updated: true, diverged: false }
 }
 
-/** Does this failure mean "GitHub could not be reached at all", as opposed to one of the
- * specific, named conditions this app already has its own recovery story for? `GithubStore`'s
- * own `request()` (src/store/github.ts) translates every GitHub-side failure this app
- * distinguishes into one of `ALL_ERROR_CLASSES` (src/store/errors.ts) -- an invalid/expired
- * token, a public repo, a missing data branch, a rate limit it already gave up retrying, a
- * duplicate branch-init -- each with its own UI recovery affordance (that file's own header
- * comment: "Task 19 switches on class identity to pick the matching recovery affordance").
- * Anything else reaching this point is, by construction, a failure from BELOW that translation
- * layer -- the `fetch` call itself never got a response to classify. Confirmed in this
- * project's own Node 24 runtime, not assumed: `fetch()` against an unreachable host rejects
- * with a plain `TypeError` ("fetch failed", `.cause` the underlying DNS/connection error),
- * never one of GithubStore's named classes. This function does not need that exact shape to be
- * correct, though -- it treats ANY error that is not one of the six named classes as
- * unreachable, which is exactly as correct against a real browser's own network-error
- * `TypeError` as it is against whatever a test injects in its place (this file's own
- * `fetchThatIsOffline` throws a plain `TypeError` for precisely this reason: it is the
- * realistic shape, not an arbitrary one). */
+/** Does this failure mean "GitHub could not be reached at all"? Review round 1 (Important 3)
+ * overturned this function's original exclusion-based test ("not one of GithubStore's named
+ * error classes") after a live reproduction: `GithubStore.request()`'s own generic fallback
+ * (`if (!res.ok) throw new Error(...)`, src/store/github.ts) fires for ANY unmapped non-2xx
+ * status -- a real response GitHub *did* send -- and `write()`'s blob/tree/commit POSTs pass no
+ * `errorFor` at all, so a genuine, deterministic GitHub-side error (a transient 500, say) threw
+ * a plain, unclassified `Error` that was indistinguishable, by exclusion, from a real network
+ * failure. The old test would have queued it, and it would have failed identically on every
+ * future replay -- a dead end with no diagnostic, which spec §13 forbids for any failure state.
+ *
+ * Fixed by testing POSITIVELY for the one shape a genuine network failure actually takes.
+ * Confirmed in this project's own Node 24 runtime, not assumed: `fetch()` against an
+ * unreachable host rejects with a plain `TypeError` ("fetch failed", `.cause` the underlying
+ * DNS/connection error) -- and `request()`'s own generic non-2xx fallback throws `new
+ * Error(...)`, a plain `Error`, never a `TypeError`. The two are different constructors, not
+ * just different messages, which is what makes this a real positive test rather than a
+ * relabelled exclusion: nothing else in `GithubStore.write`'s own call path throws a bare
+ * `TypeError` for a reason OTHER than the underlying `fetch` call itself failing (confirmed by
+ * reading `write` in full: no property access there can produce one, since nothing it reads off
+ * a parsed response is ever dereferenced further than a single, directly-read field).
+ *
+ * This is deliberately a narrower claim than the original comment made, and is why that one was
+ * wrong: this function cannot see every GithubStore-external TypeError that might theoretically
+ * exist (a decrypt bug, a passphrase mismatch after some future feature) -- which is exactly why
+ * `attemptWrite` below only ever consults this around the single, narrow `store.write` call, not
+ * around its own conflict-resolution follow-ups, where a `TypeError` would mean something else
+ * entirely. */
 function isUnreachable(err: unknown): boolean {
-  return !ALL_ERROR_CLASSES.some((ErrorClass) => err instanceof ErrorClass)
+  return err instanceof TypeError
 }
 
-/** One real write attempt, shared by `commit`'s own first attempt and `replayPendingCommit`'s
+/** One real write attempt, shared by `commit`'s own first attempt and `replayPendingCommits`'s
  * replay of a previously-queued one -- both need identical handling once the attempt is in
- * flight (spec §6.5): on success, advance the cached vault, clear BOTH the draft and any
- * queued pending commit (a direct success here means whatever this write carries supersedes
- * anything still queued from an earlier offline episode -- every commit this app makes always
- * carries the full current text, never a diff, so there is nothing left in an older queued
- * attempt that this one doesn't already include), and update the session in place so later
- * code reading `s.text`/`s.baseSha` sees the just-committed version. On a stale base, fetch
- * `theirs` (current head) and `base` (`readAt(baseSha)` -- the version this attempt actually
- * started from), decrypt all three versions and run the three-way merge, returning the
- * conflict for the UI to resolve. On anything else {@link isUnreachable} recognises as GitHub
- * being unreachable, returns `{ unreachable: true }` instead of throwing -- a third, ordinary
- * return value, not an exception, specifically so neither caller has to distinguish it from a
- * genuinely unexpected failure by inspecting the error itself (see below). Never retried here,
- * never auto-resolved, never discarded -- `commit`/`replayPendingCommit` decide what happens
- * next with any of these three outcomes, this function only produces them.
+ * flight (spec §6.5).
+ *
+ * **On success:** advances the cached vault and updates the session in place
+ * (`s.text`/`s.baseSha`) so later code sees the just-committed version. The draft is cleared
+ * ONLY IF it is still exactly the one this attempt started from -- `draftSavedAtAtStart` is the
+ * caller's own draft `savedAt` as read at the moment it decided what to write, captured BEFORE
+ * the real time this write takes (0.4-2s of scrypt plus a network round trip, during which the
+ * same tab's autosave debounce -- or another tab's -- can easily land a newer draft; spec §8
+ * explicitly allows autosave to keep running while an explicit commit is in flight). Review
+ * round 1 (Critical 2) found and fixed a real bug here: the original version cleared
+ * unconditionally, destroying that newer draft's only persisted copy the instant the write
+ * happened to resolve. The fix mirrors `putDraft`'s own existing compare-before-write discipline
+ * (src/store/local.ts) -- an inconsistency in the original design, not a new mechanism: if the
+ * draft is unchanged, clearing it is exactly as safe as before; if it changed, it is rebased
+ * onto the sha just committed (so the user's in-flight typing does not later conflict against
+ * its own prior write) rather than deleted. This does not need its own cross-tab atomicity
+ * guard beyond what already exists: the rebase write goes through `local.putDraft` itself,
+ * which already refuses to let an older write clobber a newer one (so a THIRD, even-newer
+ * draft landing in the brief window between this function's own re-read and its rebase write
+ * simply wins on its own, via that existing guard, leaving this rebase safely skipped rather
+ * than corrupting anything -- the one cost is a false-positive conflict on the next commit
+ * attempt against a `baseSha` that is technically one step behind, which the ordinary
+ * conflict path already handles safely).
+ *
+ * **On a stale base:** fetches `theirs` (current head) and `base` (`readAt(baseSha)` -- the
+ * version this attempt actually started from), decrypts all three versions and runs the
+ * three-way merge, returning the conflict for the UI to resolve. Never retried, never
+ * auto-resolved.
+ *
+ * **On anything else {@link isUnreachable} recognises as GitHub being unreachable:** returns
+ * `{ unreachable: true }` instead of throwing -- a third, ordinary return value, not an
+ * exception, specifically so neither caller has to distinguish it from a genuinely unexpected
+ * failure by inspecting the error itself.
  *
  * `isUnreachable` is deliberately consulted ONLY around the initial `store.write` call, not
- * wrapped around the conflict-resolution follow-up calls below it. A first cut of this
- * function caught that whole `try` broadly instead, which silently created a real bug: once
- * `StaleWriteError` is already confirmed (meaning GitHub was DEFINITELY reached and gave a real
- * answer), a *different* failure while fetching/decrypting `theirs`/`base` -- a dropped
- * connection mid-conflict-resolution, a corrupted remote blob, a genuinely wrong passphrase
- * (e.g. after a future passphrase-change feature leaves mixed-passphrase history, spec §13's
- * last row) -- is not evidence of being offline at all, and `isUnreachable` cannot tell the
- * difference from the outside: a decrypt failure is exactly as "not one of
- * `ALL_ERROR_CLASSES`" as a real network `TypeError` is. Catching only the narrow, single
- * `store.write` call keeps that whole class of failure propagating as a genuine rejection,
- * never silently reclassified as "still offline, queue the original attempt" by a caller that
- * has no way to know better (this file's own "propagates raw, never silently queued" test
- * below is what catches a regression back to the broader `try`).
+ * wrapped around the conflict-resolution follow-up calls below it (a first cut of this function
+ * caught that whole `try` broadly instead, which conflated "the write never reached GitHub" with
+ * "GitHub was reached, said stale, and THEN something else failed" -- see `isUnreachable`'s own
+ * doc comment for why those are not the same thing and must not be classified the same way).
  *
  * `mineText` is passed in by the caller rather than derived from `armored` here so neither
  * caller ever pays for a redundant scrypt-protected decrypt of content it already holds as
  * plaintext: `commit` always already has it (the caller's own `text` argument); a replay does
  * not (only ciphertext survives a queued commit -- see `PendingCommit`'s own doc comment in
- * src/store/local.ts), so `replayPendingCommit` decrypts once, itself, before calling this. */
+ * src/store/local.ts), so `replayPendingCommits` decrypts once, itself, before calling this. */
 async function attemptWrite(
   s: Session,
   store: GithubStore,
   local: LocalStore,
   pending: { mineText: string; armored: string; baseSha: string; message: string },
+  draftSavedAtAtStart: number | null,
 ): Promise<{ sha: string } | { conflict: Conflict } | { unreachable: true }> {
   let sha: string
   try {
@@ -175,8 +254,12 @@ async function attemptWrite(
     throw err
   }
   await local.putCachedVault({ armored: pending.armored, sha })
-  await local.clearDraft()
-  await local.clearPendingCommit()
+  const draftNow = await local.getDraft()
+  if (draftNow === null || draftNow.savedAt === draftSavedAtAtStart) {
+    await local.clearDraft()
+  } else {
+    await local.putDraft({ ...draftNow, baseSha: sha })
+  }
   s.text = pending.mineText
   s.baseSha = sha
   return { sha }
@@ -193,79 +276,111 @@ function saveMessage(): string {
 
 /** Commits `text` as the vault's new revision (spec §6.4/§6.5). Three outcomes:
  *
- * - **Written.** The common case: `store.write` succeeds, the cached vault advances, the draft
- *   is cleared, and `{ sha }` is returned.
+ * - **Written.** The common case: `store.write` succeeds, the cached vault advances, and
+ *   `{ sha }` is returned. See `attemptWrite`'s own doc comment for exactly when the draft is
+ *   cleared vs. rebased.
  * - **Conflict.** `store.write` is rejected as a non-fast-forward (`StaleWriteError`, spec
  *   §6.4's `force: false` guarantee) -- some other device committed since this edit's base.
  *   Never retried and never auto-resolved: `attemptWrite` fetches `theirs`/`base`, merges
  *   locally, and this returns `{ conflict }` for the UI to show (spec §6.5).
- * - **Queued.** `store.write` fails for a reason that is not one of GithubStore's own named,
- *   recoverable conditions (`isUnreachable` -- overwhelmingly, GitHub could not be reached at
- *   all). Rather than losing the edit or surfacing a raw network error, it is encrypted and
- *   held as the single queued {@link PendingCommit} (src/store/local.ts), ready for
- *   `replayPendingCommit` once connectivity returns (spec §13's "editing continues; commit
- *   queues and retries on reconnect"). A second commit attempted while one is already queued
- *   simply replaces it (`local.putPendingCommit` is a plain overwrite, not a list) -- every
- *   commit already carries the full current text, so the newer attempt strictly supersedes
- *   whatever the older one was trying to save; there is nothing in the first attempt that
- *   survives independently of the second one's own content. Every other named `GithubStore`
- *   error (an invalid token, a now-public repo, an exhausted rate limit, ...) propagates
- *   unchanged instead -- each has its own specific UI recovery affordance (Task 19), and
- *   silently queuing one of those would retry something retrying can never fix.
+ * - **Queued.** `store.write` fails for a reason {@link isUnreachable} recognises as "GitHub
+ *   could not be reached at all". Rather than losing the edit or surfacing a raw network error,
+ *   it is encrypted and appended to the offline queue (`local.enqueuePendingCommit`, an
+ *   append-only list -- see that method's own doc comment in src/store/local.ts for why review
+ *   round 1 replaced the original single-slot design: a second tab independently queuing from
+ *   the same base must never destroy a first tab's own still-unreplayed entry). Can itself throw
+ *   `PendingQueueFullError` if the queue is already at capacity -- left to propagate unchanged;
+ *   the edit is not lost either way, since a failed enqueue never touches the draft, but it
+ *   cannot be queued for automatic replay until the queue drains. Every other named
+ *   `GithubStore` error (an invalid token, a now-public repo, an exhausted rate limit, a
+ *   genuine-but-unmapped HTTP error, ...) propagates unchanged instead -- each has its own
+ *   specific UI recovery affordance (Task 19), or at minimum a visible, distinguishable failure,
+ *   and silently queuing one of those would retry something retrying can never fix.
  *
  * `baseSha` -- what this edit actually started from -- is read from the stored {@link Draft}
  * (`local.getDraft()`) when one exists, not from `s.baseSha` directly: see
  * {@link syncFromRemote}'s own doc comment for why the two are not provably the same value
  * (two tabs, one IndexedDB). Falls back to `s.baseSha` only when there is no stored draft at
  * all -- e.g. committing immediately after unlock, before any autosave has run -- where the
- * session's own base is the only "what was this built from" the app has. */
+ * session's own base is the only "what was this built from" the app has. The same `draft` read
+ * also captures `savedAt` for `attemptWrite`'s own clear-vs-rebase decision (one read serving
+ * both purposes, not two). */
 export async function commit(s: Session, text: string, store: GithubStore, local: LocalStore): Promise<CommitResult> {
   const draft = await local.getDraft()
   const baseSha = draft?.baseSha ?? s.baseSha
   const armored = await encryptVault(text, s.passphrase)
   const message = saveMessage()
 
-  const result = await attemptWrite(s, store, local, { mineText: text, armored, baseSha, message })
+  const result = await attemptWrite(s, store, local, { mineText: text, armored, baseSha, message }, draft?.savedAt ?? null)
   if ("unreachable" in result) {
-    await local.putPendingCommit({ armored, baseSha, message })
+    await local.enqueuePendingCommit({ armored, baseSha, message })
     return { queued: true }
   }
   return result
 }
 
-/** Replays the single queued {@link PendingCommit} (src/store/local.ts), if there is one --
+/** Replays the offline queue (`local.getPendingCommits()`, src/store/local.ts), oldest first --
  * the other half of spec §13's "commit queues and retries on reconnect". Returns `null` with no
  * network call at all when nothing is queued, so a caller (Task 14's `online` event handler) can
  * call this unconditionally on every reconnect without first checking whether anything is
  * actually pending.
  *
- * Shares `attemptWrite` with `commit`, so a successful replay has IDENTICAL effects to a
- * successful direct commit (cached vault advances, draft clears, session updates) -- the user
- * never sees a difference between "saved immediately" and "saved once back online" beyond the
- * `{ queued: true }` this app shows meanwhile. The one thing specific to replay: if the queued
- * attempt itself now conflicts (someone else committed while this device was offline), the
- * queue is cleared here before returning the conflict -- a conflict is, per this task's own
- * brief, "a real answer, not a transient failure", so replaying the identical stale content
- * again on a later reconnect would only reproduce the same conflict forever. The one case that
- * deliberately does NOT clear the queue: a renewed {@link isUnreachable} result (still offline,
- * or offline again) is converted back into a rejected promise here -- this function's own
- * contract has no silent "still queued" return distinct from "nothing was queued at all"
- * (`null`), so a caller must be able to tell the two apart by `await` rejecting rather than by
- * inspecting a value -- leaving the pending commit exactly where it was for a future reconnect
- * to retry. Nothing has actually been resolved yet, so nothing here is thrown away. */
-export async function replayPendingCommit(
-  s: Session,
-  store: GithubStore,
-  local: LocalStore,
-): Promise<{ sha: string } | { conflict: Conflict } | null> {
-  const pending = await local.getPendingCommit()
-  if (pending === null) return null
+ * Processes entries strictly one at a time (never concurrently -- each may itself need the
+ * sequential scrypt-protected decrypts `attemptWrite`'s own conflict path uses), continuing to
+ * the next only after the current one is fully resolved one way or another:
+ *
+ * - **Success** -- dequeues that entry (`local.dequeueOldestPendingCommit`) and continues to the
+ *   next queued entry, if any. A queue that drains completely with no conflicts becomes exactly
+ *   that many real, independent commits (review round 1's own ruling: "N queued entries
+ *   replaying as N commits gives a truthful history" -- never squashed into one).
+ * - **Conflict** -- dequeues that entry too (a conflict is, per this task's own brief, "a real
+ *   answer, not a transient failure", so replaying the identical stale content again later would
+ *   only reproduce the same conflict forever) and STOPS, returning the conflict immediately.
+ *   Any later-queued entries are left exactly as they are -- not attempted this call -- for a
+ *   future replay after the user resolves this one (a normal, direct `commit` with their chosen
+ *   resolution, which does not touch the rest of the queue at all; see `attemptWrite`'s own
+ *   `putCachedVault`/draft handling, which was deliberately NOT extended to also clear other
+ *   queued entries on an unrelated success -- review round 1 rejected exactly that kind of
+ *   "these must be equivalent, so discard" reasoning for Critical 1, and the same reasoning
+ *   applies here: a later entry's own real conflict, if any, is what safely discovers whether it
+ *   was actually superseded, never an assumption made on its behalf).
+ * - **Still unreachable** -- records the failed attempt (`local.recordPendingCommitAttemptFailed`)
+ *   and STOPS, returning whatever was already committed earlier in this same call plus
+ *   `unreachable: true`. The entry stays queued, exactly as it was, for a future call. If this
+ *   is the entry's `MAX_REPLAY_ATTEMPTS`th consecutive unreachable result, throws
+ *   {@link ReplayRepeatedlyUnreachableError} instead of returning normally -- see that class's
+ *   own doc comment; the entry is still never discarded, only the silent-retry signal changes to
+ *   a louder one. */
+export async function replayPendingCommits(s: Session, store: GithubStore, local: LocalStore): Promise<ReplayOutcome | null> {
+  let queue = await local.getPendingCommits()
+  if (queue.length === 0) return null
 
-  const mineText = await decryptVault(pending.armored, s.passphrase)
-  const result = await attemptWrite(s, store, local, { mineText, ...pending })
-  if ("unreachable" in result) {
-    throw new Error("replayPendingCommit: GitHub is still unreachable -- left queued for a later retry")
+  const committedShas: string[] = []
+  for (;;) {
+    if (queue.length === 0) return { committedShas, conflict: null, unreachable: false }
+
+    const entry = queue[0]
+    const mineText = await decryptVault(entry.armored, s.passphrase)
+    const draftBeforeThisAttempt = await local.getDraft()
+    const result = await attemptWrite(
+      s,
+      store,
+      local,
+      { mineText, armored: entry.armored, baseSha: entry.baseSha, message: entry.message },
+      draftBeforeThisAttempt?.savedAt ?? null,
+    )
+
+    if ("unreachable" in result) {
+      const attempts = await local.recordPendingCommitAttemptFailed(entry)
+      if (attempts !== null && attempts >= MAX_REPLAY_ATTEMPTS) throw new ReplayRepeatedlyUnreachableError()
+      return { committedShas, conflict: null, unreachable: true }
+    }
+    if ("conflict" in result) {
+      await local.dequeueOldestPendingCommit(entry)
+      return { committedShas, conflict: result.conflict, unreachable: false }
+    }
+    committedShas.push(result.sha)
+    await local.dequeueOldestPendingCommit(entry)
+    queue = await local.getPendingCommits()
   }
-  if ("conflict" in result) await local.clearPendingCommit()
-  return result
 }

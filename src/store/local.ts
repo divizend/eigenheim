@@ -17,7 +17,7 @@ export const DB_NAME = "eigenheim"
 const DB_VERSION = 1
 const STORE_NAME = "slots"
 
-type SlotKey = "wrappedIdentity" | "token" | "draft" | "cachedVault" | "pendingCommit"
+type SlotKey = "wrappedIdentity" | "token" | "draft" | "cachedVault" | "pendingCommits"
 
 /** The in-progress document plus the commit it was last synced against
  * (`baseSha`), and when it was saved -- `savedAt` is what lets
@@ -46,13 +46,39 @@ export interface CachedVault {
  * `GithubStore.write`'s own `armored` parameter needs -- never the plaintext and never the
  * passphrase, consistent with every other slot in this file: nothing here is ever a secret in
  * the clear. `baseSha`/`message` are the rest of what that same call needs to retry the exact
- * same attempt unchanged once connectivity returns. This file has no dependency on
- * src/store/github.ts and shouldn't gain one just for this doc comment -- hence the plain
- * prose reference instead of a `{@link}`. */
+ * same attempt unchanged once connectivity returns. `attempts` -- how many consecutive times a
+ * replay of this exact entry has failed as unreachable -- is src/session/sync.ts's own bounded
+ * retry bookkeeping (mirroring GithubStore's own rate-limit retry count), not anything this
+ * file interprets. This file has no dependency on src/store/github.ts and shouldn't gain one
+ * just for this doc comment -- hence the plain prose reference instead of a `{@link}`. */
 export interface PendingCommit {
   armored: string
   baseSha: string
   message: string
+  attempts: number
+}
+
+/** Bounded capacity for the pending-commit queue (below) -- generous for any realistic amount
+ * of offline editing (a single small text file, saved by an explicit Ctrl+S), but a real bound
+ * rather than none: a cap with an explicit, loud {@link PendingQueueFullError} is what review
+ * round 1 (Critical 1) replaced "replace the queue" with, specifically so an enqueue can never
+ * silently drop an edit instead of refusing outright. */
+export const MAX_PENDING_COMMITS = 50
+
+/** Thrown by {@link LocalStore.enqueuePendingCommit} when the queue is already at
+ * {@link MAX_PENDING_COMMITS} -- a loud, named failure rather than a enqueue that silently
+ * drops the oldest (or the new) entry. src/session/sync.ts's `commit` lets this propagate
+ * unchanged: the edit itself is not lost either way (it is still sitting in the draft, which a
+ * failed enqueue never touches), but it cannot be queued for automatic replay until the queue
+ * has room. */
+export class PendingQueueFullError extends Error {
+  constructor(
+    message = `the offline commit queue is full (${MAX_PENDING_COMMITS}) -- reconnect to let it drain before saving again`,
+    options?: ErrorOptions,
+  ) {
+    super(message, options)
+    this.name = "PendingQueueFullError"
+  }
 }
 
 function openDb(): Promise<IDBDatabase> {
@@ -86,7 +112,7 @@ function transactionDone(tx: IDBTransaction): Promise<void> {
 
 /** The browser-side persistence for everything this app keeps between
  * sessions: a wrapped device identity, a GitHub token, an in-progress
- * draft, a cached vault, and a queued offline commit -- see the module doc
+ * draft, a cached vault, and a queue of offline commits -- see the module doc
  * comment above and spec §7.
  * One instance per tab; every instance opens the same underlying database,
  * by design -- two tabs on the same device share one IndexedDB (spec review
@@ -216,7 +242,7 @@ export class LocalStore {
    * {@link putDraft}'s own counterpart cannot express this, since {@link Draft} has no
    * optional fields and so no way to `put` "nothing is pending" through that method. Called
    * only after a commit genuinely reaches GitHub (src/session/sync.ts's `commit` and
-   * `replayPendingCommit`, both on success): from that point {@link getCachedVault} and the
+   * `replayPendingCommits`, both on success): from that point {@link getCachedVault} and the
    * just-committed text agree, so there is no separate local-only state left to track until
    * the next edit writes a new draft. A plain key delete, not a write of some null-ish
    * sentinel value through {@link putDraft} -- {@link Draft}'s fields are all required, so a
@@ -238,36 +264,108 @@ export class LocalStore {
     return this.getSlot<CachedVault>("cachedVault")
   }
 
-  /** Queues (or replaces) the one commit attempt waiting on connectivity -- see
-   * {@link PendingCommit}. A single slot, not a list, by design (task brief): every commit
-   * this app ever makes already carries the FULL current text, never a diff, so a second
-   * commit attempted while one is already queued strictly supersedes the first -- there is no
-   * reason to ever replay the older, now-superseded snapshot once a newer one exists. A plain,
-   * unconditional put, unlike {@link putDraft}'s own monotonic-write guard: that guard exists
-   * for two tabs racing to autosave the SAME in-progress document against each other's clock
-   * (Review Focus 4), which is a real, tested concern for drafts but not one this task's brief
-   * raises for the commit queue -- last-write-wins is the correct behaviour here regardless of
-   * which of two racing callers' writes happens to land last, since both are, by construction,
-   * at least as current as whichever the user triggered most recently. */
-  async putPendingCommit(p: PendingCommit): Promise<void> {
-    await this.putSlot("pendingCommit", p)
+  /** Appends a new commit attempt to the offline queue -- see {@link PendingCommit}. **An
+   * append-only list, replayed oldest-first, never coalesced** -- review round 1 (Critical 1)
+   * overturned this task's original single-slot design after a live reproduction: two tabs on
+   * the same device (Review Focus 4's own threat model) can each independently go offline from
+   * the SAME base, each queuing its own edit without ever having seen the other's -- "A" from
+   * tab 1, then "B" from tab 2, both based on the identical `baseSha`. A single slot's own
+   * unconditional overwrite made "B" silently destroy "A" with no trace in any other slot (not
+   * the draft -- `commit` never writes one -- not the cached vault -- the write never
+   * succeeded). The original justification ("every commit carries the full text, so a newer
+   * attempt supersedes an older one") is true for ONE continuous editing stream but false
+   * across two tabs that diverged from the same base without either seeing the other's change
+   * -- there is no text-level relationship between "A" and "B" at all, let alone one
+   * superseding the other. Two narrower fixes were considered and rejected (coordinator's own
+   * ruling): merging the two entries needs the base TEXT, and offline is exactly when a
+   * differing `baseSha`'s base may be unfetchable; coalescing only when `baseSha` happens to
+   * match reintroduces the same "these two must be equivalent" reasoning that failed here.
+   * Keeping both, replayed in order, is what the rest of this design already has a safe answer
+   * for: a later one that turns out to conflict with an earlier one's own successful replay
+   * goes through the ordinary three-way-merge conflict path, same as any other stale write.
+   *
+   * The read-current-length-then-append happens inside ONE readwrite transaction, matching
+   * {@link putDraft}'s own reasoning exactly (two tabs enqueueing "simultaneously" is the same
+   * shape of race `putDraft`'s own monotonic-write guard exists for, just append-don't-merge
+   * instead of keep-the-larger-savedAt) -- IndexedDB's transaction mutual exclusion guarantees
+   * the second transaction's read observes the first's already-committed append, so neither
+   * tab's entry is ever lost to the other, regardless of which one's transaction happens to run
+   * first.
+   *
+   * Throws {@link PendingQueueFullError} at {@link MAX_PENDING_COMMITS} rather than silently
+   * dropping the new entry (or evicting the oldest) -- a cap with a loud, named failure is what
+   * this review round added once "just keep everything forever" was no longer the brief's own
+   * stated single-slot simplicity. */
+  async enqueuePendingCommit(p: { armored: string; baseSha: string; message: string }): Promise<void> {
+    const db = await this.db()
+    const tx = db.transaction(STORE_NAME, "readwrite")
+    const store = tx.objectStore(STORE_NAME)
+    const existing = (await requestToPromise<PendingCommit[] | undefined>(store.get("pendingCommits"))) ?? []
+    if (existing.length >= MAX_PENDING_COMMITS) {
+      await transactionDone(tx)
+      throw new PendingQueueFullError()
+    }
+    store.put([...existing, { ...p, attempts: 0 }], "pendingCommits")
+    await transactionDone(tx)
   }
 
-  async getPendingCommit(): Promise<PendingCommit | null> {
-    return this.getSlot<PendingCommit>("pendingCommit")
+  /** The full offline-commit queue, oldest first (append order) -- empty, never `null`, when
+   * nothing is queued, since "a list with nothing in it" is the natural empty state for a list
+   * (unlike the single-item slots elsewhere in this file, where `null` means "absent"). */
+  async getPendingCommits(): Promise<PendingCommit[]> {
+    return (await this.getSlot<PendingCommit[]>("pendingCommits")) ?? []
   }
 
-  /** Removes the queued commit once it no longer needs replaying -- either because it was
-   * just written for real (src/session/sync.ts, on success), or because replaying it
+  /** Removes the front (oldest) entry once it no longer needs replaying -- either because it
+   * was just written for real (src/session/sync.ts, on success), or because replaying it
    * surfaced a genuine conflict there: once shown to the user as a conflict it is "a real
    * answer, not a transient failure" (this task's own brief) and must never be replayed
    * verbatim again on a later reconnect -- the user's chosen resolution becomes a brand new,
-   * ordinary commit instead, not a retry of this one. */
-  async clearPendingCommit(): Promise<void> {
+   * ordinary commit instead, not a retry of this one.
+   *
+   * `expected` is the exact entry the caller just finished attempting (matched by `armored`
+   * and `baseSha`, which together are unique in practice -- two genuinely different edits never
+   * encrypt to the same ciphertext). Removing by VALUE rather than blindly slicing off whatever
+   * is currently at index 0 is deliberate: if something else already mutated the front of the
+   * queue since this caller read it (another tab's own concurrent replay of the same entry --
+   * not a scenario this review round's own two reproductions needed, but one line of defence
+   * is cheap given how expensive the single-slot version's equivalent blind-overwrite turned
+   * out to be), this becomes a safe no-op instead of removing the wrong thing. Same
+   * single-transaction read-then-write shape as {@link enqueuePendingCommit}/
+   * {@link recordPendingCommitAttemptFailed}, for the same reason. */
+  async dequeueOldestPendingCommit(expected: { armored: string; baseSha: string }): Promise<void> {
     const db = await this.db()
     const tx = db.transaction(STORE_NAME, "readwrite")
-    tx.objectStore(STORE_NAME).delete("pendingCommit")
+    const store = tx.objectStore(STORE_NAME)
+    const existing = (await requestToPromise<PendingCommit[] | undefined>(store.get("pendingCommits"))) ?? []
+    if (existing.length > 0 && existing[0].armored === expected.armored && existing[0].baseSha === expected.baseSha) {
+      store.put(existing.slice(1), "pendingCommits")
+    }
     await transactionDone(tx)
+  }
+
+  /** Increments the front entry's `attempts` counter (src/session/sync.ts's bounded-replay
+   * bookkeeping, mirroring GithubStore's own rate-limit retry count) and persists it -- same
+   * value-matched, single-transaction safety as {@link dequeueOldestPendingCommit}, and for the
+   * same reason. Returns the resulting count, or `null` if `expected` no longer matched the
+   * front entry (so a caller never trusts a number that was not actually the one just
+   * persisted). The entry is NEVER removed here, no matter how high the count climbs -- only
+   * {@link dequeueOldestPendingCommit} ever removes anything, so a repeatedly-failing replay
+   * degrades to "stop retrying silently and say so" (sync.ts's own cap), never to "give up and
+   * discard the edit". */
+  async recordPendingCommitAttemptFailed(expected: { armored: string; baseSha: string }): Promise<number | null> {
+    const db = await this.db()
+    const tx = db.transaction(STORE_NAME, "readwrite")
+    const store = tx.objectStore(STORE_NAME)
+    const existing = (await requestToPromise<PendingCommit[] | undefined>(store.get("pendingCommits"))) ?? []
+    if (existing.length === 0 || existing[0].armored !== expected.armored || existing[0].baseSha !== expected.baseSha) {
+      await transactionDone(tx)
+      return null
+    }
+    const attempts = existing[0].attempts + 1
+    store.put([{ ...existing[0], attempts }, ...existing.slice(1)], "pendingCommits")
+    await transactionDone(tx)
+    return attempts
   }
 
   async clear(): Promise<void> {

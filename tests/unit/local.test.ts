@@ -1,7 +1,15 @@
 import { readFile } from "node:fs/promises"
 import { resolve } from "node:path"
 import "fake-indexeddb/auto"
-import { LocalStore, DB_NAME, type Draft, type CachedVault, type PendingCommit } from "../../src/store/local"
+import {
+  LocalStore,
+  DB_NAME,
+  MAX_PENDING_COMMITS,
+  PendingQueueFullError,
+  type Draft,
+  type CachedVault,
+  type PendingCommit,
+} from "../../src/store/local"
 import { generateDeviceIdentity, wrapIdentity } from "../../src/vault/identity"
 import { encryptToRecipient } from "../../src/vault/crypto"
 
@@ -73,42 +81,107 @@ test("each slot round-trips and is absent before first write", async () => {
   expect(await store.getToken()).toBeNull()
   expect(await store.getDraft()).toBeNull()
   expect(await store.getCachedVault()).toBeNull()
-  expect(await store.getPendingCommit()).toBeNull()
+  expect(await store.getPendingCommits()).toEqual([])
 
   const draft: Draft = { armored: "draft-armor", baseSha: "base-sha-1", savedAt: 1000 }
   const cached: CachedVault = { armored: "vault-armor", sha: "vault-sha-1" }
-  const pending: PendingCommit = { armored: "pending-armor", baseSha: "base-sha-1", message: "save" }
   await store.putWrappedIdentity("wrapped-identity-armor")
   await store.putToken("token-armor")
   await store.putDraft(draft)
   await store.putCachedVault(cached)
-  await store.putPendingCommit(pending)
+  await store.enqueuePendingCommit({ armored: "pending-armor", baseSha: "base-sha-1", message: "save" })
 
   expect(await store.getWrappedIdentity()).toBe("wrapped-identity-armor")
   expect(await store.getToken()).toBe("token-armor")
   expect(await store.getDraft()).toEqual(draft)
   expect(await store.getCachedVault()).toEqual(cached)
-  expect(await store.getPendingCommit()).toEqual(pending)
+  const pending: PendingCommit = { armored: "pending-armor", baseSha: "base-sha-1", message: "save", attempts: 0 }
+  expect(await store.getPendingCommits()).toEqual([pending])
 })
 
-test("clearDraft removes only the draft, clearPendingCommit removes only the queued commit", async () => {
-  // Neither Draft nor PendingCommit has an optional field, so neither can be "cleared" through
-  // its own putter (there is no value meaning "nothing pending") -- these two dedicated
-  // deletes are what src/session/sync.ts relies on instead. Proven side by side, each seeded
-  // alongside the other two untouched slots, so a delete that accidentally reached the wrong
-  // key (or wiped the whole store, like clear() deliberately does) would be caught here.
+test("enqueuePendingCommit appends -- it never overwrites an existing unreplayed entry", async () => {
+  // Review round 1, Critical 1's own fix: a single slot's bare overwrite let a second queued
+  // commit silently destroy a first one from a different tab that never saw it (see
+  // sync.test.ts's own reproduction for the full scenario). The list itself, at the storage
+  // layer, is what this test pins: enqueuing twice must grow the list, not replace its one
+  // element.
+  const store = new LocalStore()
+  await store.enqueuePendingCommit({ armored: "A", baseSha: "s", message: "m1" })
+  await store.enqueuePendingCommit({ armored: "B", baseSha: "s", message: "m2" })
+
+  const queue = await store.getPendingCommits()
+  expect(queue.map((p) => p.armored)).toEqual(["A", "B"])
+})
+
+test("enqueuePendingCommit refuses past the cap with a named error, never silently dropping anything", async () => {
+  const store = new LocalStore()
+  for (let i = 0; i < MAX_PENDING_COMMITS; i++) {
+    await store.enqueuePendingCommit({ armored: `entry-${i}`, baseSha: "s", message: "m" })
+  }
+  expect((await store.getPendingCommits()).length).toBe(MAX_PENDING_COMMITS)
+
+  await expect(store.enqueuePendingCommit({ armored: "one-too-many", baseSha: "s", message: "m" })).rejects.toThrow(
+    PendingQueueFullError,
+  )
+  // Refused, not silently dropped -- the queue is unchanged, not missing its oldest entry
+  // either.
+  const queue = await store.getPendingCommits()
+  expect(queue.length).toBe(MAX_PENDING_COMMITS)
+  expect(queue[0].armored).toBe("entry-0")
+})
+
+test("dequeueOldestPendingCommit removes only the matching front entry, leaving the rest", async () => {
+  const store = new LocalStore()
+  await store.enqueuePendingCommit({ armored: "A", baseSha: "s", message: "m1" })
+  await store.enqueuePendingCommit({ armored: "B", baseSha: "s", message: "m2" })
+
+  await store.dequeueOldestPendingCommit({ armored: "A", baseSha: "s" })
+
+  expect((await store.getPendingCommits()).map((p) => p.armored)).toEqual(["B"])
+})
+
+test("dequeueOldestPendingCommit is a safe no-op when the front entry no longer matches", async () => {
+  // Defence in depth against a concurrent mutation (another tab's own replay) having already
+  // changed the front of the queue -- removing by value, not blindly by index, means a stale
+  // caller can never remove the wrong entry.
+  const store = new LocalStore()
+  await store.enqueuePendingCommit({ armored: "A", baseSha: "s", message: "m1" })
+
+  await store.dequeueOldestPendingCommit({ armored: "not-the-real-front", baseSha: "s" })
+
+  expect((await store.getPendingCommits()).map((p) => p.armored)).toEqual(["A"])
+})
+
+test("recordPendingCommitAttemptFailed increments the front entry's attempts and returns the new count", async () => {
+  const store = new LocalStore()
+  await store.enqueuePendingCommit({ armored: "A", baseSha: "s", message: "m1" })
+
+  expect(await store.recordPendingCommitAttemptFailed({ armored: "A", baseSha: "s" })).toBe(1)
+  expect(await store.recordPendingCommitAttemptFailed({ armored: "A", baseSha: "s" })).toBe(2)
+  expect((await store.getPendingCommits())[0].attempts).toBe(2)
+})
+
+test("recordPendingCommitAttemptFailed returns null and changes nothing when the entry no longer matches", async () => {
+  const store = new LocalStore()
+  await store.enqueuePendingCommit({ armored: "A", baseSha: "s", message: "m1" })
+
+  expect(await store.recordPendingCommitAttemptFailed({ armored: "not-the-real-front", baseSha: "s" })).toBeNull()
+  expect((await store.getPendingCommits())[0].attempts).toBe(0)
+})
+
+test("clearDraft removes only the draft, leaving the rest of the store untouched", async () => {
+  // Draft has no optional field, so it cannot be "cleared" through its own putter (there is no
+  // value meaning "nothing pending") -- this dedicated delete is what src/session/sync.ts
+  // relies on instead. Proven alongside another untouched slot, so a delete that accidentally
+  // reached the wrong key (or wiped the whole store, like clear() deliberately does) would be
+  // caught here.
   const store = new LocalStore()
   await store.putWrappedIdentity("wrapped-identity-armor")
   await store.putDraft({ armored: "draft-armor", baseSha: "s", savedAt: 1 })
-  await store.putPendingCommit({ armored: "pending-armor", baseSha: "s", message: "m" })
 
   await store.clearDraft()
-  expect(await store.getDraft()).toBeNull()
-  expect(await store.getPendingCommit()).not.toBeNull()
-  expect(await store.getWrappedIdentity()).toBe("wrapped-identity-armor")
 
-  await store.clearPendingCommit()
-  expect(await store.getPendingCommit()).toBeNull()
+  expect(await store.getDraft()).toBeNull()
   expect(await store.getWrappedIdentity()).toBe("wrapped-identity-armor")
 })
 
@@ -136,7 +209,7 @@ test("no slot ever holds the passphrase", async () => {
   // four, so it gets the same regression guard rather than being left uncovered by this test
   // just because it was added later.
   const pendingArmor = await encryptToRecipient("pending commit plaintext, never the passphrase", recipient)
-  await store.putPendingCommit({ armored: pendingArmor, baseSha: "base-sha-2", message: "save" })
+  await store.enqueuePendingCommit({ armored: pendingArmor, baseSha: "base-sha-2", message: "save" })
 
   const serialized = JSON.stringify(await dumpAll())
   expect(serialized).not.toContain(passphrase)
@@ -247,7 +320,7 @@ test("clear() removes every slot", async () => {
   await store.putToken("token-armor")
   await store.putDraft({ armored: "draft-armor", baseSha: "base-sha-3", savedAt: 1 })
   await store.putCachedVault({ armored: "vault-armor", sha: "vault-sha-3" })
-  await store.putPendingCommit({ armored: "pending-armor", baseSha: "base-sha-3", message: "save" })
+  await store.enqueuePendingCommit({ armored: "pending-armor", baseSha: "base-sha-3", message: "save" })
 
   await store.clear()
 
@@ -255,5 +328,5 @@ test("clear() removes every slot", async () => {
   expect(await store.getToken()).toBeNull()
   expect(await store.getDraft()).toBeNull()
   expect(await store.getCachedVault()).toBeNull()
-  expect(await store.getPendingCommit()).toBeNull()
+  expect(await store.getPendingCommits()).toEqual([])
 })
