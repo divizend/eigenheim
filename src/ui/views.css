@@ -552,3 +552,129 @@
   display: block;
   color: var(--text);
 }
+
+/* ---------------------------------------------------------------------------------------------
+   Settings (src/ui/settings.ts). Four rare, consequential jobs on one page, each in its own
+   block so none is reachable by accident while aiming at another.
+   --------------------------------------------------------------------------------------------- */
+
+.settings {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 32px 24px 64px;
+  text-align: left;
+}
+
+.settings-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.settings-head h1 {
+  font-family: var(--heading);
+  color: var(--text-h);
+  margin: 0;
+}
+
+.settings-head button {
+  font-family: var(--sans);
+  font-size: 14px;
+  padding: 8px 16px;
+  border-radius: 6px;
+  border: 2px solid var(--border);
+  background: var(--bg);
+  color: var(--text-h);
+  cursor: pointer;
+}
+
+.settings-block {
+  margin-top: 32px;
+  padding-top: 24px;
+  border-top: 1px solid var(--border);
+}
+
+.settings-block h2 {
+  font-family: var(--heading);
+  font-size: 18px;
+  color: var(--text-h);
+  margin: 0 0 8px;
+}
+
+.settings-block p {
+  color: var(--text);
+  line-height: 1.6;
+}
+
+.settings-block label {
+  display: block;
+  margin: 16px 0 6px;
+  color: var(--text-h);
+  font-size: 14px;
+}
+
+.settings-block input[type="text"],
+.settings-block input[type="password"],
+.settings-block textarea {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: var(--mono);
+  font-size: 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text-h);
+}
+
+.settings-block > button {
+  font-family: var(--sans);
+  font-size: 14px;
+  padding: 8px 16px;
+  margin-top: 12px;
+  border-radius: 6px;
+  border: 2px solid var(--accent-border);
+  background: var(--bg);
+  color: var(--accent);
+  cursor: pointer;
+}
+
+#qr-area canvas {
+  display: block;
+  margin: 16px 0;
+  background: #fff;
+  padding: 12px;
+  border-radius: 6px;
+}
+
+#qr-area button {
+  font-family: var(--sans);
+  font-size: 14px;
+  padding: 8px 16px;
+  margin-top: 12px;
+  border-radius: 6px;
+  border: 2px solid var(--border);
+  background: var(--bg);
+  color: var(--text-h);
+  cursor: pointer;
+}
+
+/* The integrity verdict is the one place in this app where colour carries meaning, so it is
+   paired with the word WARNING in the text itself (src/ui/settings.ts) rather than relying on
+   the border alone. */
+#integrity {
+  border-left: 3px solid var(--border);
+  padding: 8px 12px;
+  font-size: 14px;
+}
+
+#integrity[data-verdict="match"] {
+  border-left-color: #22a05a;
+}
+
+#integrity[data-verdict="mismatch"] {
+  border-left-color: #dc4646;
+  color: var(--text-h);
+  font-weight: 600;
+}

@@ -8,6 +8,7 @@ import { renderUnlock } from "./ui/unlock"
 import { renderEditor } from "./ui/editor"
 import { renderConflict } from "./ui/conflict"
 import { renderHistory } from "./ui/history"
+import { renderSettings } from "./ui/settings"
 import type { Session } from "./session/unlock"
 
 /** The one place a `GithubStore` is constructed from a token (ruling R3's seam, used identically
@@ -35,6 +36,17 @@ function openEditor(root: HTMLElement, local: LocalStore, session: Session): voi
         session,
         io: { local, makeStore },
         onResolved: (text) => reopen(text),
+      })
+    },
+    onOpenSettings: (text) => {
+      session.text = text
+      renderSettings(root, {
+        session,
+        io: { local, makeStore },
+        text,
+        // `changePassphrase` may have advanced `session.text`/`baseSha`/`passphrase` in place,
+        // so the editor re-opens on the session rather than on the `text` captured above.
+        onClose: () => openEditor(root, local, session),
       })
     },
     onOpenHistory: (text) => {

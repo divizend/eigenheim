@@ -20,7 +20,7 @@ import type { Session } from "../session/unlock"
 import type { GithubStore } from "../store/github"
 import type { LocalStore } from "../store/local"
 import { commit, syncFromRemote, replayPendingCommits, isUnreachable, type Conflict } from "../session/sync"
-import { encryptToRecipient, decryptWithIdentity } from "../vault/crypto"
+import { encryptToRecipient, decryptWithIdentity, WrongPassphraseError } from "../vault/crypto"
 import { recipientFor } from "../vault/identity"
 
 /** How long after the last keystroke the draft is written (spec §8's "short debounce").
@@ -69,6 +69,9 @@ export interface EditorDeps extends SessionIO {
    * screen so history diffs against what the user is actually looking at rather than against
    * the last committed version. */
   onOpenHistory: (text: string) => void
+  /** Leaves the editor for settings (task 17), handing over the text on screen because a
+   * passphrase rotation re-encrypts exactly that, not the last committed version. */
+  onOpenSettings: (text: string) => void
 }
 
 /** What the editor shows the moment it mounts -- see {@link openDocument}. */
@@ -235,7 +238,24 @@ function storeFor(session: Session, io: SessionIO): GithubStore | null {
  * spec §13's richer per-class affordances (a settings link, a token walkthrough) are Task 19's
  * `renderFailure`; until then the message itself plus the editor's own still-working text is the
  * visible state, never a silent `catch`. */
+/** Turns a thrown error from the save path into something a user can act on.
+ *
+ * The `WrongPassphraseError` case is the carry recorded into task 17, decided here rather than
+ * left to propagate raw. It arises from exactly one situation, and it is a real one once task
+ * 17's passphrase rotation exists: `attemptWrite` resolving a conflict has to DECRYPT the
+ * version already on GitHub to merge against it (src/session/sync.ts), and if that version was
+ * written by a device still using the previous passphrase, this session cannot read it. The raw
+ * message ("wrong passphrase") is actively misleading there -- the passphrase the user just
+ * unlocked with is correct, it is the remote version that is out of step -- so it is replaced
+ * with what is actually true and what actually helps. */
 function failureText(err: unknown): string {
+  if (err instanceof WrongPassphraseError) {
+    return (
+      "Your passphrase is correct for this device, but the version now on GitHub was saved with a different one — " +
+      "another device has not been updated since the passphrase was changed. Your text is safe here and on this device. " +
+      "Unlock that other device and change its passphrase too, or restore an earlier version from History, then save again."
+    )
+  }
   return err instanceof Error ? err.message : String(err)
 }
 
@@ -396,7 +416,14 @@ export function renderEditor(root: HTMLElement, deps: EditorDeps): void {
   historyBtn.textContent = "History"
   historyBtn.addEventListener("click", () => deps.onOpenHistory(textarea.value))
 
-  status.append(indicator, notice, historyBtn)
+  const settingsBtn = document.createElement("button")
+  settingsBtn.type = "button"
+  settingsBtn.className = "editor-nav"
+  settingsBtn.dataset.testid = "open-settings"
+  settingsBtn.textContent = "Settings"
+  settingsBtn.addEventListener("click", () => deps.onOpenSettings(textarea.value))
+
+  status.append(indicator, notice, historyBtn, settingsBtn)
   container.append(textarea, status)
   root.replaceChildren(container)
 

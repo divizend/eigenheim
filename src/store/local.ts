@@ -250,6 +250,32 @@ export class LocalStore {
     await this.putSlot("cachedVault", c)
   }
 
+  /** Replaces BOTH passphrase-protected slots in ONE transaction, for a passphrase rotation
+   * (task 17).
+   *
+   * Two separate `putSlot` calls would not do, and the reason is specific rather than general
+   * caution: `device.age` and `vault.age` are the only two things on this device encrypted under
+   * the PASSPHRASE (`token.age` and `draft.age` are encrypted to the device identity instead, so
+   * a passphrase change does not touch them). If a rotation updated one and not the other, the
+   * device would hold two slots under two different passphrases, and no single passphrase would
+   * open both -- `src/session/unlock.ts` decrypts the cached vault first and unwraps the identity
+   * second, so the user would get their text but never their token, and recovering the token
+   * needs the identity, which needs the passphrase that no longer opens it. A circular dead end,
+   * in a project whose whole design has no recovery key.
+   *
+   * One transaction removes the state rather than documenting it: IndexedDB aborts the whole
+   * transaction if any write in it fails, so the pair moves together or not at all. Same
+   * single-transaction discipline as {@link putDraft} and {@link enqueuePendingCommit}, for the
+   * same reason -- a partial write here is not recoverable by retrying. */
+  async putRotatedPassphraseSlots(next: { wrappedIdentity: string; cachedVault: CachedVault }): Promise<void> {
+    const db = await this.db()
+    const tx = db.transaction(STORE_NAME, "readwrite")
+    const store = tx.objectStore(STORE_NAME)
+    store.put(next.cachedVault, "cachedVault")
+    store.put(next.wrappedIdentity, "wrappedIdentity")
+    await transactionDone(tx)
+  }
+
   async getCachedVault(): Promise<CachedVault | null> {
     return this.getSlot<CachedVault>("cachedVault")
   }
