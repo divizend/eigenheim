@@ -1,0 +1,152 @@
+/* Shared layout for every view built on src/ui/'s pattern (setup now; unlock/editor/conflict/
+   history/settings in later tasks). Reuses src/style.css's own custom properties (--text, --bg,
+   --border, --accent, --mono, ...) for visual consistency rather than redefining a second
+   palette -- main.ts imports both files, this one second so its rules win on any overlap. */
+
+.wizard-step {
+  width: 100%;
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 48px 20px;
+  text-align: left;
+  box-sizing: border-box;
+}
+
+.wizard-progress {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--text);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin: 0 0 8px;
+}
+
+.wizard-step h1 {
+  font-size: 28px;
+  margin: 0 0 20px;
+}
+
+.wizard-step p {
+  margin: 0 0 16px;
+  line-height: 150%;
+}
+
+.wizard-step label:not(.wizard-checkbox) {
+  display: block;
+  font-weight: 600;
+  margin: 20px 0 6px;
+}
+
+.wizard-step input[type="text"] {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: var(--mono);
+  font-size: 15px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text-h);
+}
+
+.wizard-checkbox {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 24px 0;
+  cursor: pointer;
+}
+
+.wizard-walkthrough {
+  padding-left: 20px;
+  line-height: 160%;
+}
+
+.wizard-walkthrough code {
+  font-family: var(--mono);
+  background: var(--code-bg);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+.wizard-repo {
+  font-family: var(--mono);
+  font-size: 18px;
+  padding: 10px 14px;
+  background: var(--code-bg);
+  border-radius: 6px;
+  display: inline-block;
+}
+
+.wizard-feedback {
+  color: var(--text-h);
+  background: var(--accent-bg);
+  border: 1px solid var(--accent-border);
+  border-radius: 6px;
+  padding: 10px 14px;
+  margin: 12px 0;
+}
+
+.wizard-feedback a {
+  color: inherit;
+}
+
+.wizard-sheet {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 20px;
+  margin: 16px 0 24px;
+}
+
+.wizard-sheet pre,
+.wizard-sheet code {
+  font-family: var(--mono);
+}
+
+.wizard-sheet pre {
+  background: var(--code-bg);
+  padding: 10px 14px;
+  border-radius: 6px;
+  overflow-x: auto;
+}
+
+.wizard-actions {
+  display: flex;
+  gap: 12px;
+  margin-top: 28px;
+}
+
+.wizard-actions button {
+  font-family: var(--sans);
+  font-size: 15px;
+  padding: 10px 20px;
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background: var(--accent-bg);
+  color: var(--accent);
+  cursor: pointer;
+}
+
+.wizard-actions button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.wizard-actions button:not(:disabled):hover {
+  border-color: var(--accent-border);
+}
+
+[data-testid="editor-placeholder"] {
+  max-width: 640px;
+  margin: 48px auto;
+  padding: 0 20px;
+  text-align: left;
+}
+
+[data-testid="editor-placeholder"] pre {
+  font-family: var(--mono);
+  background: var(--code-bg);
+  padding: 14px;
+  border-radius: 6px;
+  min-height: 200px;
+}

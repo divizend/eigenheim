@@ -1,60 +1,52 @@
-import './style.css'
-import heroImg from './assets/hero.png'
-import typescriptLogo from './assets/typescript.svg'
-import viteLogo from './assets/vite.svg'
-import { setupCounter } from './counter.ts'
+import "./style.css"
+import "./ui/views.css"
+import { LocalStore } from "./store/local"
+import { GithubStore } from "./store/github"
+import { repoOwner, repoSlug } from "./config"
+import { renderSetup } from "./ui/setup"
+import type { Session } from "./session/unlock"
 
-document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
-<section id="center">
-  <div class="hero">
-    <img src="${heroImg}" class="base" width="170" height="179">
-    <img src="${typescriptLogo}" class="framework" alt="TypeScript logo"/>
-    <img src="${viteLogo}" class="vite" alt="Vite logo" />
-  </div>
-  <div>
-    <h1>Get started</h1>
-    <p>Edit <code>src/main.ts</code> and save to test <code>HMR</code></p>
-  </div>
-  <button id="counter" type="button" class="counter"></button>
-</section>
+/** Placeholder for Task 14's real editor -- this task's own brief only requires that completing
+ * setup "lands in the editor", not that the editor itself exists yet (Task 14: "Unlock view and
+ * editor" creates src/ui/editor.ts). Built via DOM methods, not an innerHTML template: `session.text`
+ * is decrypted vault content and, like the passphrase (src/ui/setup.ts's own recovery-sheet
+ * comment), must never be interpolated into an HTML string. */
+function renderEditorPlaceholder(root: HTMLElement, session: Session): void {
+  const container = document.createElement("div")
+  container.dataset.testid = "editor-placeholder"
 
-<div class="ticks"></div>
+  const heading = document.createElement("h1")
+  heading.textContent = "Vault ready"
 
-<section id="next-steps">
-  <div id="docs">
-    <svg class="icon" role="presentation" aria-hidden="true"><use href="/icons.svg#documentation-icon"></use></svg>
-    <h2>Documentation</h2>
-    <p>Your questions, answered</p>
-    <ul>
-      <li>
-        <a href="https://vite.dev/" target="_blank">
-          <img class="logo" src="${viteLogo}" alt="" />
-          Explore Vite
-        </a>
-      </li>
-      <li>
-        <a href="https://www.typescriptlang.org" target="_blank">
-          <img class="button-icon" src="${typescriptLogo}" alt="">
-          Learn more
-        </a>
-      </li>
-    </ul>
-  </div>
-  <div id="social">
-    <svg class="icon" role="presentation" aria-hidden="true"><use href="/icons.svg#social-icon"></use></svg>
-    <h2>Connect with us</h2>
-    <p>Join the Vite community</p>
-    <ul>
-      <li><a href="https://github.com/vitejs/vite" target="_blank"><svg class="button-icon" role="presentation" aria-hidden="true"><use href="/icons.svg#github-icon"></use></svg>GitHub</a></li>
-      <li><a href="https://chat.vite.dev/" target="_blank"><svg class="button-icon" role="presentation" aria-hidden="true"><use href="/icons.svg#discord-icon"></use></svg>Discord</a></li>
-      <li><a href="https://x.com/vite_js" target="_blank"><svg class="button-icon" role="presentation" aria-hidden="true"><use href="/icons.svg#x-icon"></use></svg>X.com</a></li>
-      <li><a href="https://bsky.app/profile/vite.dev" target="_blank"><svg class="button-icon" role="presentation" aria-hidden="true"><use href="/icons.svg#bluesky-icon"></use></svg>Bluesky</a></li>
-    </ul>
-  </div>
-</section>
+  const note = document.createElement("p")
+  note.textContent = "Setup is complete. The real editor lands in Task 14 -- this is a placeholder."
 
-<div class="ticks"></div>
-<section id="spacer"></section>
-`
+  const pre = document.createElement("pre")
+  pre.textContent = session.text
 
-setupCounter(document.querySelector<HTMLButtonElement>('#counter')!)
+  container.append(heading, note, pre)
+  root.replaceChildren(container)
+}
+
+async function main(): Promise<void> {
+  const root = document.querySelector<HTMLDivElement>("#app")
+  if (!root) throw new Error("no #app root element found")
+
+  const local = new LocalStore()
+  const wrappedIdentity = await local.getWrappedIdentity()
+
+  if (wrappedIdentity === null) {
+    renderSetup(root, {
+      local,
+      makeStore: (token) => new GithubStore({ owner: repoOwner(), repo: repoSlug(), token }),
+      onComplete: (session) => renderEditorPlaceholder(root, session),
+    })
+    return
+  }
+
+  // Unlock view lands in Task 14 -- this device has already completed setup, but there is
+  // nothing yet to route it to.
+  root.textContent = "This device is already set up. The unlock view is not built yet (Task 14)."
+}
+
+void main()
