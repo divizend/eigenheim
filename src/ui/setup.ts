@@ -21,7 +21,7 @@ import type { LocalStore } from "../store/local"
 import type { Session } from "../session/unlock"
 import { repoOwner, repoSlug, VAULT_PATH } from "../config"
 import { generateDeviceIdentity, wrapIdentity } from "../vault/identity"
-import { encryptVault, encryptToRecipient } from "../vault/crypto"
+import { encryptVault, encryptToRecipient, decryptVault, WrongPassphraseError } from "../vault/crypto"
 import { generatePassphrase, checkPassphrase, normalizePassphrase } from "../vault/passphrase"
 import { TokenError, RepoPublicError } from "../store/errors"
 
@@ -177,6 +177,18 @@ function renderTokenStep(root: HTMLElement, deps: Deps, state: WizardState): voi
       <div class="wizard-actions">
         <button type="button" id="continue-btn" disabled>Continue</button>
       </div>
+
+      <details class="wizard-transfer" data-testid="transfer-details">
+        <summary>I already set this up on another device</summary>
+        <p>Open <strong>Settings &rarr; Add another device</strong> there and reveal the transfer
+          code. Scan it, or paste the text form below — it carries the token, so you do not need
+          to create a second one.</p>
+        <button type="button" id="scan-btn" data-testid="scan-btn" hidden>Scan the code with this camera</button>
+        <label for="transfer-input">Transfer code</label>
+        <textarea id="transfer-input" data-testid="transfer-input" rows="3" spellcheck="false"></textarea>
+        <div id="transfer-feedback" class="wizard-feedback" data-testid="transfer-feedback" role="alert" hidden></div>
+        <button type="button" id="use-transfer" data-testid="use-transfer">Use this code</button>
+      </details>
     `,
   )
 
@@ -186,6 +198,45 @@ function renderTokenStep(root: HTMLElement, deps: Deps, state: WizardState): voi
 
   tokenInput.addEventListener("input", () => {
     continueBtn.disabled = tokenInput.value.trim().length === 0
+  })
+
+  // --- transfer from an already-set-up device (task 18) --------------------------------------
+  const transferInput = required<HTMLTextAreaElement>(root, "#transfer-input")
+  const transferFeedback = required<HTMLDivElement>(root, "#transfer-feedback")
+  const scanBtn = required<HTMLButtonElement>(root, "#scan-btn")
+
+  // Offered only when the browser can actually do it. Never blocking on it: `BarcodeDetector` is
+  // absent in Firefox and Safari entirely, and absent in Chromium without a camera, so the paste
+  // field is the primary path and scanning is the shortcut -- not the other way round.
+  if (barcodeScanningAvailable()) scanBtn.hidden = false
+
+  scanBtn.addEventListener("click", () => {
+    void (async () => {
+      transferFeedback.hidden = true
+      const scanned = await scanTransferCode()
+      if (scanned === null) {
+        transferFeedback.textContent =
+          "The camera could not be used for scanning. Paste the text form of the code below instead — it works the same way."
+        transferFeedback.hidden = false
+        return
+      }
+      transferInput.value = scanned
+    })()
+  })
+
+  required<HTMLButtonElement>(root, "#use-transfer").addEventListener("click", () => {
+    const parsed = parseTransferPayload(transferInput.value)
+    if (parsed.kind === "invalid") {
+      transferFeedback.textContent = parsed.message
+      transferFeedback.hidden = false
+      return
+    }
+    transferFeedback.hidden = true
+    // The payload's token is put through the SAME validation every manually-pasted token gets:
+    // a transfer code is a convenience, not a reason to trust a credential less carefully.
+    tokenInput.value = parsed.payload.token
+    continueBtn.disabled = false
+    void attemptValidate()
   })
 
   function showFeedback(html: string): void {
@@ -198,17 +249,19 @@ function renderTokenStep(root: HTMLElement, deps: Deps, state: WizardState): voi
     const store = deps.makeStore(tokenInput.value)
     try {
       const { ready } = await store.ensureSetup()
-      if (ready) {
-        showFeedback(
-          `<p>This repository already has a vault set up. If you are adding a second device,
-           use the QR transfer from Settings on your already-set-up device instead of this
-           wizard.</p>`,
-        )
-        continueBtn.disabled = tokenInput.value.trim().length === 0
-        return
-      }
       state.token = tokenInput.value
       state.store = store
+      if (ready) {
+        // The repository already holds a vault, so there is nothing to initialise -- this device
+        // JOINS it instead (task 18). This branch is also the whole of ruling R29's fix: it used
+        // to dead-end here, telling the user to use the QR transfer from an already-set-up
+        // device, which is unhelpful for a second device (that IS what they are doing) and
+        // actively impossible for a device stranded by a mid-setup failure, where the only
+        // already-set-up device is this one. Either way the way forward is the same and is now
+        // taken automatically: ask for the passphrase and adopt the existing vault.
+        renderAdoptStep(root, deps, state)
+        return
+      }
       renderPassphraseStep(root, deps, state)
     } catch (err) {
       if (err instanceof RepoPublicError) {
@@ -273,6 +326,222 @@ export function errorRecoveryHtml(err: unknown): string {
     `
   }
   return `<p>${escapeHtml(err instanceof Error ? err.message : String(err))}</p>`
+}
+
+// ---------------------------------------------------------------------------------------------
+// Second-device transfer (task 18, spec §9). A transfer code carries the repo coordinates and
+// the GitHub token from an already-set-up device, so a second device never has to create a
+// second token. The PASSPHRASE is deliberately not in it and never will be -- it is the one
+// secret this project never transmits, so joining a vault always costs the user one typed
+// passphrase, which is also the only thing that can actually decrypt anything.
+// ---------------------------------------------------------------------------------------------
+
+/** What a transfer code decodes to. Mirrors `TransferPayload` in src/ui/settings.ts, which is
+ * the producing side. */
+export interface TransferPayload {
+  owner: string
+  repo: string
+  token: string
+}
+
+export type TransferParse = { kind: "ok"; payload: TransferPayload } | { kind: "invalid"; message: string }
+
+/** Parses and validates a pasted or scanned transfer code.
+ *
+ * Every rejection names what is actually wrong rather than "invalid code", because the realistic
+ * failures here are mundane and each has a different fix: a half-copied string, a code from a
+ * DIFFERENT repository's deployment, or something that is not a transfer code at all. Spec §13
+ * asks for a way forward, and "invalid" is not one. */
+export function parseTransferPayload(text: string): TransferParse {
+  const trimmed = text.trim()
+  if (trimmed.length === 0) return { kind: "invalid", message: "Paste the transfer code first." }
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(trimmed)
+  } catch {
+    return {
+      kind: "invalid",
+      message:
+        "That does not look like a transfer code. Copy the whole text shown under the QR on your other device — it starts with { and ends with }.",
+    }
+  }
+  if (typeof parsed !== "object" || parsed === null) {
+    return { kind: "invalid", message: "That transfer code is not in the expected form." }
+  }
+  const { owner, repo, token } = parsed as Record<string, unknown>
+  if (typeof owner !== "string" || typeof repo !== "string" || typeof token !== "string") {
+    return {
+      kind: "invalid",
+      message: "That transfer code is incomplete — it is missing the repository or the token. Copy the whole thing and try again.",
+    }
+  }
+  if (owner !== repoOwner() || repo !== repoSlug()) {
+    return {
+      kind: "invalid",
+      message: `That code is for ${owner}/${repo}, but this app is deployed for ${repoOwner()}/${repoSlug()}. Use the deployment that matches, or take the code from a device set up for this one.`,
+    }
+  }
+  return { kind: "ok", payload: { owner, repo, token } }
+}
+
+/** Whether this browser can scan a QR from the camera.
+ *
+ * `BarcodeDetector` is genuinely absent in Firefox and Safari, and absent in Chromium without a
+ * camera, so this is a real branch rather than defensive decoration -- and the paste field
+ * exists precisely so no part of onboarding ever depends on the answer being yes. */
+export function barcodeScanningAvailable(): boolean {
+  return typeof (globalThis as { BarcodeDetector?: unknown }).BarcodeDetector !== "undefined"
+}
+
+/** Opens the camera, reads one QR, and returns its text — or null if anything at all prevents
+ * that. Null rather than a throw: the caller's response is identical for every cause (fall back
+ * to the paste field), and a rejected camera permission is not an error worth a stack trace. */
+export async function scanTransferCode(): Promise<string | null> {
+  if (!barcodeScanningAvailable()) return null
+  let stream: MediaStream | null = null
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } })
+    const video = document.createElement("video")
+    video.srcObject = stream
+    video.playsInline = true
+    await video.play()
+
+    const Detector = (globalThis as unknown as { BarcodeDetector: new (o: { formats: string[] }) => { detect(src: CanvasImageSource): Promise<Array<{ rawValue: string }>> } }).BarcodeDetector
+    const detector = new Detector({ formats: ["qr_code"] })
+
+    // Bounded: a scan that never finds a code must give the paste field back rather than hold
+    // the camera open forever.
+    const deadline = Date.now() + 20_000
+    while (Date.now() < deadline) {
+      const found = await detector.detect(video)
+      if (found.length > 0) return found[0].rawValue
+      await new Promise((r) => setTimeout(r, 200))
+    }
+    return null
+  } catch {
+    return null
+  } finally {
+    stream?.getTracks().forEach((t) => t.stop())
+  }
+}
+
+/** Joins a vault that already exists on the repo: decrypt it with the passphrase the user types,
+ * then store this device's own slots.
+ *
+ * Writes `putWrappedIdentity` LAST, after the token and the cached vault — the same ordering
+ * ruling R27 established for {@link finishSetup}, for the same reason: src/main.ts's only
+ * "already set up" gate is `getWrappedIdentity() !== null`, so the gating value must be the one
+ * thing proven safe to write. A failure anywhere earlier leaves that null and the device simply
+ * re-enters this wizard.
+ *
+ * A wrong passphrase is returned as an outcome rather than thrown, because it is the single most
+ * likely thing to happen here and is not an error anyone needs to debug. */
+export type AdoptOutcome =
+  | { kind: "joined"; session: Session }
+  | { kind: "wrong-passphrase" }
+  | { kind: "failed"; message: string }
+
+export async function adoptExistingVault(
+  typed: string,
+  params: { token: string; store: GithubStore; identityPromise: Promise<{ identity: string; recipient: string }> },
+  local: LocalStore,
+): Promise<AdoptOutcome> {
+  const passphrase = normalizePassphrase(typed)
+  if (passphrase.length === 0) return { kind: "failed", message: "Type the passphrase from your other device." }
+
+  let head: { armored: string; sha: string }
+  try {
+    head = await params.store.readHead()
+  } catch (err) {
+    return { kind: "failed", message: err instanceof Error ? err.message : String(err) }
+  }
+
+  let text: string
+  try {
+    text = await decryptVault(head.armored, passphrase)
+  } catch (err) {
+    if (err instanceof WrongPassphraseError) return { kind: "wrong-passphrase" }
+    return { kind: "failed", message: err instanceof Error ? err.message : String(err) }
+  }
+
+  const { identity, recipient } = await params.identityPromise
+  const wrappedIdentity = await wrapIdentity(identity, passphrase)
+  const wrappedToken = await encryptToRecipient(params.token, recipient)
+
+  await local.putToken(wrappedToken)
+  await local.putCachedVault({ armored: head.armored, sha: head.sha })
+  await local.putWrappedIdentity(wrappedIdentity)
+
+  return { kind: "joined", session: { text, baseSha: head.sha, token: params.token, identity, passphrase } }
+}
+
+/** The adopt step: the only thing left to ask for is the passphrase. */
+function renderAdoptStep(root: HTMLElement, deps: Deps, state: WizardState): void {
+  root.innerHTML = shell(
+    4,
+    "Unlock the existing vault",
+    `
+      <p data-testid="adopt-intro">This repository already holds a vault, so there is nothing to
+        create — this device just needs to join it. Type the passphrase you chose when you first
+        set it up. It is never sent anywhere.</p>
+      <label for="adopt-passphrase">Passphrase</label>
+      <input type="password" id="adopt-passphrase" data-testid="adopt-passphrase" autocomplete="current-password" spellcheck="false">
+      <p id="adopt-feedback" class="wizard-feedback" data-testid="adopt-feedback" role="alert" hidden></p>
+      <p id="adopt-progress" class="unlock-progress" data-testid="adopt-progress" role="status" hidden>Decrypting the vault…</p>
+      <div class="wizard-actions">
+        <button type="button" id="adopt-btn" data-testid="adopt-btn">Join this vault</button>
+      </div>
+    `,
+  )
+
+  const input = required<HTMLInputElement>(root, "#adopt-passphrase")
+  const feedback = required<HTMLParagraphElement>(root, "#adopt-feedback")
+  const progress = required<HTMLParagraphElement>(root, "#adopt-progress")
+  const button = required<HTMLButtonElement>(root, "#adopt-btn")
+
+  let running = false
+  async function attempt(): Promise<void> {
+    // Guarded, not merely disabled: Enter is a second trigger, and two concurrent attempts mean
+    // two concurrent scrypt runs, which spec §5.4 forbids outright.
+    if (running) return
+    if (!state.store) throw new Error("setup wizard: no GitHub store -- the token step never completed")
+    running = true
+    button.disabled = true
+    feedback.hidden = true
+    progress.hidden = false
+
+    const outcome = await adoptExistingVault(
+      input.value,
+      { token: state.token, store: state.store, identityPromise: state.identityPromise },
+      deps.local,
+    )
+
+    progress.hidden = true
+    running = false
+    button.disabled = false
+
+    if (outcome.kind === "joined") {
+      input.value = ""
+      deps.onComplete(outcome.session)
+      return
+    }
+    feedback.textContent =
+      outcome.kind === "wrong-passphrase"
+        ? "That passphrase did not open this vault. Check for a typo — including capitals — and try again. It is the passphrase from your other device, not a new one."
+        : outcome.message
+    feedback.hidden = false
+    input.select()
+  }
+
+  button.addEventListener("click", () => void attempt())
+  input.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") {
+      ev.preventDefault()
+      void attempt()
+    }
+  })
+  input.focus()
 }
 
 // ---------------------------------------------------------------------------------------------

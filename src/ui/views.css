@@ -678,3 +678,43 @@
   color: var(--text-h);
   font-weight: 600;
 }
+
+/* The second-device transfer affordance inside the token step (src/ui/setup.ts, task 18).
+   A disclosure rather than a visible alternative path: the overwhelmingly common case is a first
+   device, and offering "I already have another device" with equal weight would make the ordinary
+   path look like a choice to be deliberated. */
+.wizard-transfer {
+  margin-top: 28px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border);
+}
+
+.wizard-transfer summary {
+  cursor: pointer;
+  color: var(--accent);
+  font-size: 14px;
+}
+
+.wizard-transfer textarea {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: var(--mono);
+  font-size: 13px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text-h);
+}
+
+.wizard-transfer button {
+  font-family: var(--sans);
+  font-size: 14px;
+  padding: 8px 16px;
+  margin-top: 10px;
+  border-radius: 6px;
+  border: 2px solid var(--border);
+  background: var(--bg);
+  color: var(--text-h);
+  cursor: pointer;
+}
