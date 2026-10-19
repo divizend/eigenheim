@@ -6,6 +6,8 @@ import {
   BranchMissingError,
   RateLimitedError,
   AlreadyInitializedError,
+  PendingQueueFullError,
+  ReplayRepeatedlyUnreachableError,
   ALL_ERROR_CLASSES,
 } from "../../src/store/errors"
 import { VAULT_PATH, DATA_BRANCH } from "../../src/config"
@@ -249,16 +251,23 @@ test("readAt reads the vault at a specific historical commit, without walking th
   ])
 })
 
-test("ALL_ERROR_CLASSES lists exactly the six named error classes, each constructible with no arguments", () => {
+test("ALL_ERROR_CLASSES lists exactly the eight named error classes, each constructible with no arguments", () => {
   // Task 7 amendment: Task 19's failure-recovery UI test enumerates this
   // array to prove every error class renders a visible way forward, so a
   // class silently missing here (or a stray duplicate) would silently
   // narrow -- or pad -- that coverage. Sorted before comparing: this array
-  // is "the six classes, as a set", not a promise about declaration
+  // is "the N classes, as a set", not a promise about declaration
   // order. (Task 9 fix round 1 added AlreadyInitializedError as the sixth --
   // this is exactly the drift this test exists to catch, and it did: this
   // test started failing the moment that class was added to
-  // ALL_ERROR_CLASSES but not here, which is how this update was found.)
+  // ALL_ERROR_CLASSES but not here, which is how this update was found.
+  // Task 12 review round 2 repeated the exact same drift, independently:
+  // PendingQueueFullError/ReplayRepeatedlyUnreachableError were added to
+  // src/store/errors.ts and to ALL_ERROR_CLASSES, but this test's own
+  // `expected` array was not updated in the same pass -- caught the same
+  // way, by this test failing (`expected [...8] to deeply equal [...6]`)
+  // the moment the two classes existed without being named here too.
+  // Updated deliberately, not silently, as part of closing that gap.)
   const expected = [
     StaleWriteError,
     TokenError,
@@ -266,6 +275,8 @@ test("ALL_ERROR_CLASSES lists exactly the six named error classes, each construc
     BranchMissingError,
     RateLimitedError,
     AlreadyInitializedError,
+    PendingQueueFullError,
+    ReplayRepeatedlyUnreachableError,
   ]
   const byName = (a: { name: string }, b: { name: string }) => a.name.localeCompare(b.name)
   expect([...ALL_ERROR_CLASSES].sort(byName)).toEqual([...expected].sort(byName))
@@ -278,8 +289,13 @@ test("ALL_ERROR_CLASSES lists exactly the six named error classes, each construc
     expect(instance).toBeInstanceOf(Error)
     // Catches a copy-paste slip (e.g. two classes' constructors both
     // setting the same this.name) that the sorted-array check above
-    // cannot: that check only sees the five constructor *references*,
-    // never an instance's own runtime .name.
+    // cannot: that check only sees the eight constructor *references*,
+    // never an instance's own runtime .name. (This count was already
+    // stale at "five" before this update -- never corrected to "six" when
+    // AlreadyInitializedError was added in Task 9 -- fixed here too while
+    // touching this comment for Task 12 review round 2, rather than left
+    // for a future reader to notice and wonder which number, if any, is
+    // trustworthy.)
     expect(instance.name).toBe(ErrorClass.name)
   }
 })

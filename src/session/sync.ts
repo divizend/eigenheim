@@ -32,7 +32,7 @@ import type { GithubStore } from "../store/github"
 // out as an explicit type annotation anywhere in this file, since every local inferred from
 // LocalStore's own getters already has the right shape.
 import type { LocalStore, Draft } from "../store/local"
-import { StaleWriteError } from "../store/errors"
+import { StaleWriteError, ReplayRepeatedlyUnreachableError } from "../store/errors"
 import { decryptVault, encryptVault } from "../vault/crypto"
 import { merge3 } from "../vault/merge"
 
@@ -85,21 +85,13 @@ export interface ReplayOutcome {
  * returns. */
 export const MAX_REPLAY_ATTEMPTS = 5
 
-/** Thrown by `replayPendingCommits` once the front entry has failed as unreachable
- * {@link MAX_REPLAY_ATTEMPTS} times in a row -- see that constant's own doc comment. Distinct
- * from the ordinary `{ unreachable: true }` outcome specifically so a UI can tell "routine,
- * keep quietly retrying on the next reconnect" apart from "this has been failing for a while,
- * say something" (review round 1, Important 3) -- without ever implying the edit itself was
- * lost, which it is not: the queue entry survives this throw untouched. */
-export class ReplayRepeatedlyUnreachableError extends Error {
-  constructor(
-    message = `GitHub has been unreachable for ${MAX_REPLAY_ATTEMPTS} consecutive reconnect attempts -- the edit is still safely queued locally, but check your connection`,
-    options?: ErrorOptions,
-  ) {
-    super(message, options)
-    this.name = "ReplayRepeatedlyUnreachableError"
-  }
-}
+// {@link ReplayRepeatedlyUnreachableError} itself now lives in src/store/errors.ts (review
+// round 2), alongside this app's other named failure modes, so Task 19's exhaustive
+// affordance test actually covers it -- being left out of that enumeration would have
+// recreated, under a better name, the exact "retries forever behind 'offline, will sync' with
+// no escalation" dead end this class exists to remove. See that file's own header comment for
+// why its default message carries no number, and why putting `MAX_REPLAY_ATTEMPTS` there
+// directly would create a circular import between this file and that one.
 
 /** Compares this session's own `baseSha` -- "the commit SHA it was read at" (see `Session`'s
  * own doc comment in src/session/unlock.ts) -- against `data`'s current head (spec §5.3's
@@ -372,7 +364,11 @@ export async function replayPendingCommits(s: Session, store: GithubStore, local
 
     if ("unreachable" in result) {
       const attempts = await local.recordPendingCommitAttemptFailed(entry)
-      if (attempts !== null && attempts >= MAX_REPLAY_ATTEMPTS) throw new ReplayRepeatedlyUnreachableError()
+      if (attempts !== null && attempts >= MAX_REPLAY_ATTEMPTS) {
+        throw new ReplayRepeatedlyUnreachableError(
+          `GitHub has been unreachable for ${attempts} consecutive reconnect attempts -- the edit is still safely queued locally, but check your connection`,
+        )
+      }
       return { committedShas, conflict: null, unreachable: true }
     }
     if ("conflict" in result) {

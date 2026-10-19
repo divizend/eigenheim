@@ -8,6 +8,8 @@
 // and must stay that way: the real `indexedDB` global, no `node:*`, no
 // `Buffer`.
 
+import { PendingQueueFullError } from "./errors"
+
 /** Exported so tests can reopen the same physical database and scan its raw
  * contents directly (bypassing this class's own getters) -- see
  * tests/unit/local.test.ts's "no slot ever holds the passphrase". Not
@@ -60,26 +62,14 @@ export interface PendingCommit {
 
 /** Bounded capacity for the pending-commit queue (below) -- generous for any realistic amount
  * of offline editing (a single small text file, saved by an explicit Ctrl+S), but a real bound
- * rather than none: a cap with an explicit, loud {@link PendingQueueFullError} is what review
- * round 1 (Critical 1) replaced "replace the queue" with, specifically so an enqueue can never
+ * rather than none: a cap with an explicit, loud {@link PendingQueueFullError} (src/store/
+ * errors.ts -- review round 2 moved it there alongside this app's other named failure modes,
+ * so Task 19's exhaustive affordance test actually covers it; see that file's own header
+ * comment for why its default message carries no number, and why putting the number there
+ * would create a circular import between this file and that one) is what review round 1
+ * (Critical 1) replaced "replace the queue" with, specifically so an enqueue can never
  * silently drop an edit instead of refusing outright. */
 export const MAX_PENDING_COMMITS = 50
-
-/** Thrown by {@link LocalStore.enqueuePendingCommit} when the queue is already at
- * {@link MAX_PENDING_COMMITS} -- a loud, named failure rather than a enqueue that silently
- * drops the oldest (or the new) entry. src/session/sync.ts's `commit` lets this propagate
- * unchanged: the edit itself is not lost either way (it is still sitting in the draft, which a
- * failed enqueue never touches), but it cannot be queued for automatic replay until the queue
- * has room. */
-export class PendingQueueFullError extends Error {
-  constructor(
-    message = `the offline commit queue is full (${MAX_PENDING_COMMITS}) -- reconnect to let it drain before saving again`,
-    options?: ErrorOptions,
-  ) {
-    super(message, options)
-    this.name = "PendingQueueFullError"
-  }
-}
 
 function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -303,7 +293,9 @@ export class LocalStore {
     const existing = (await requestToPromise<PendingCommit[] | undefined>(store.get("pendingCommits"))) ?? []
     if (existing.length >= MAX_PENDING_COMMITS) {
       await transactionDone(tx)
-      throw new PendingQueueFullError()
+      throw new PendingQueueFullError(
+        `the offline commit queue is full (${MAX_PENDING_COMMITS}) -- reconnect to let it drain before saving again`,
+      )
     }
     store.put([...existing, { ...p, attempts: 0 }], "pendingCommits")
     await transactionDone(tx)

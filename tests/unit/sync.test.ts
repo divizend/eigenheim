@@ -1,14 +1,8 @@
 import "fake-indexeddb/auto"
-import {
-  syncFromRemote,
-  commit,
-  replayPendingCommits,
-  ReplayRepeatedlyUnreachableError,
-  MAX_REPLAY_ATTEMPTS,
-  type Conflict,
-} from "../../src/session/sync"
+import { syncFromRemote, commit, replayPendingCommits, MAX_REPLAY_ATTEMPTS, type Conflict } from "../../src/session/sync"
 import type { Session } from "../../src/session/unlock"
-import { LocalStore, MAX_PENDING_COMMITS, PendingQueueFullError } from "../../src/store/local"
+import { LocalStore, MAX_PENDING_COMMITS } from "../../src/store/local"
+import { PendingQueueFullError, ReplayRepeatedlyUnreachableError } from "../../src/store/errors"
 import { GithubStore } from "../../src/store/github"
 import { encryptVault, decryptVault } from "../../src/vault/crypto"
 import { VAULT_PATH, DATA_BRANCH } from "../../src/config"

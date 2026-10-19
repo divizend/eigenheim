@@ -5,11 +5,11 @@ import {
   LocalStore,
   DB_NAME,
   MAX_PENDING_COMMITS,
-  PendingQueueFullError,
   type Draft,
   type CachedVault,
   type PendingCommit,
 } from "../../src/store/local"
+import { PendingQueueFullError } from "../../src/store/errors"
 import { generateDeviceIdentity, wrapIdentity } from "../../src/vault/identity"
 import { encryptToRecipient } from "../../src/vault/crypto"
 
