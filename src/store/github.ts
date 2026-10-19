@@ -275,7 +275,20 @@ export class GithubStore {
     this.owner = opts.owner
     this.repo = opts.repo
     this.token = GithubStore.normalizeToken(opts.token)
-    this.fetchFn = opts.fetch ?? fetch
+    // `.bind(globalThis)`, not a bare reference to the global `fetch`: every call site below
+    // invokes it as `this.fetchFn(...)`, a method-style call that binds `this` to the GithubStore
+    // instance -- and a real browser's `fetch` requires its receiver to be the global object
+    // (it reads internal slots only `Window`/`WorkerGlobalScope` carry). Calling it unbound
+    // throws `TypeError: Failed to execute 'fetch' on 'Window': Illegal invocation`, confirmed
+    // live via Playwright/Chromium while wiring src/main.ts's own production path (the first
+    // caller anywhere in this project that uses this default -- every existing
+    // tests/unit/github-*.test.ts always injects its own `fetch` stub, so this branch was never
+    // exercised before). Node's own global `fetch` (undici) does NOT enforce this -- confirmed
+    // live in this project's own Node 24 runtime, `({ f: fetch }).f(url)` resolves fine -- which
+    // is exactly why 86+ passing vitest tests never caught it: the bug only manifests in a real
+    // browser. No behaviour change for any caller that passes its own `fetch` (a test stub has no
+    // such receiver requirement, bound or not).
+    this.fetchFn = opts.fetch ?? fetch.bind(globalThis)
     this.onRetry = opts.onRetry
     this.sleepFn = opts.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)))
   }
