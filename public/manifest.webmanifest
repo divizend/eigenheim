@@ -1,0 +1,18 @@
+{
+  "name": "eigenheim",
+  "short_name": "eigenheim",
+  "description": "Your own encrypted text file. Decrypted only in your browser, stored only as ciphertext.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#aa3bff",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

@@ -779,3 +779,65 @@
   padding: 1px 5px;
   border-radius: 4px;
 }
+
+/* The service-worker update prompt (src/ui/update.ts, spec §10.1). Mounted on <body> rather
+   than inside #app so a view change never wipes a pending notice off the screen.
+
+   Deliberately NOT styled as an alert or given urgency colour: the whole value of this
+   mitigation is that the click is a deliberate one, and a banner that pressures someone into
+   clicking defeats it. */
+/* Reserve the prompt's own height at the bottom of the page whenever it is present, so a fixed
+   notice can never sit on top of a control.
+   Found by the E2E suite, not by inspection: with the prompt showing, Playwright reported
+   `<div class="update-prompt"> intercepts pointer events` on the setup wizard's "Use this code"
+   button and the click simply never landed. A notice that silently eats clicks on the controls
+   beneath it is a dead end of its own -- a user would see a button, press it, and watch nothing
+   happen, with no error anywhere to explain why. */
+body:has(.update-prompt) {
+  /* A floor only. The real reservation is set from JS in src/ui/update.ts, measured from the
+     prompt's own rendered height, because the text wraps to a different number of lines at
+     different viewport widths and no constant here can be right at all of them -- the E2E
+     caught precisely that, with a 108px prompt against a 104px constant. This rule still
+     matters for the instant between the prompt being appended and being measured. */
+  padding-bottom: 104px;
+}
+
+.update-prompt {
+  position: fixed;
+  left: 50%;
+  bottom: 16px;
+  transform: translateX(-50%);
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  max-width: min(680px, calc(100vw - 32px));
+  padding: 12px 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  box-shadow: var(--shadow);
+  font-family: var(--sans);
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text);
+  text-align: left;
+}
+
+.update-prompt button {
+  font-family: var(--sans);
+  font-size: 13px;
+  padding: 6px 12px;
+  border-radius: 6px;
+  border: 2px solid var(--border);
+  background: var(--bg);
+  color: var(--text-h);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.update-prompt button[data-testid="update-accept"] {
+  border-color: var(--accent-border);
+  color: var(--accent);
+}

@@ -10,6 +10,7 @@ import { renderConflict } from "./ui/conflict"
 import { renderHistory } from "./ui/history"
 import { renderSettings } from "./ui/settings"
 import { renderFailure } from "./ui/errors"
+import { watchForUpdates } from "./ui/update"
 import type { Session } from "./session/unlock"
 
 /** The one place a `GithubStore` is constructed from a token (ruling R3's seam, used identically
@@ -74,6 +75,12 @@ function openEditor(root: HTMLElement, local: LocalStore, session: Session): voi
 async function main(): Promise<void> {
   const root = document.querySelector<HTMLDivElement>("#app")
   if (!root) throw new Error("no #app root element found")
+
+  // Fire-and-forget, and deliberately not awaited: offline support is an enhancement, and a
+  // browser that refuses service workers (Firefox private browsing does) must still get a fully
+  // working app rather than a slower start or no start at all. The prompt mounts on <body>, not
+  // on #app, so a view re-render never wipes a pending update notice off the screen.
+  void watchForUpdates({ container: document.body })
 
   const local = new LocalStore()
 
