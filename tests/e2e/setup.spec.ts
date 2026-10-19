@@ -245,4 +245,36 @@ test.describe("setup wizard", () => {
     expect(methods("/git/commits")).toEqual(["POST"])
     expect(methods("/git/refs")).toEqual(["POST"])
   })
+
+  // Review finding 3: step 3's rich RepoPublicError handling (a direct settings link, spec §13)
+  // must not disappear the moment the SAME error type recurs at step 6 instead of step 3 -- e.g.
+  // the repo flips public again in the gap between step 3's check and clicking "Create my vault".
+  // `repoResponses` below is consumed in order across BOTH of this flow's two real
+  // `assertRepoWritable` calls (step 3's own `ensureSetup`, then step 6's `initializeDataBranch`):
+  // private the first time (so the flow gets past the token step at all), public the second.
+  test("a repo that flips public again between the token step and initializing still blocks, with the same recovery (review finding 3)", async ({
+    page,
+  }) => {
+    const { calls } = await installGithubMock(page, {
+      repoResponses: [
+        { private: true, permissions: { push: true } }, // step 3's check: private -- passes
+        { private: false, permissions: { push: true } }, // step 6's own check: public again -- blocked
+      ],
+    })
+    await driveToPassphraseStep(page)
+
+    const generatedPassphrase = await page.getByLabel(/^passphrase$/i).inputValue()
+    await page.getByLabel(/confirm passphrase/i).fill(generatedPassphrase)
+    await page.getByRole("button", { name: /continue/i }).click()
+    await page.getByRole("button", { name: /continue/i }).click() // past the recovery sheet, onto step 6
+
+    await page.getByRole("button", { name: /create my vault/i }).click()
+
+    // Same affordance as the step-3 case (test 4 above), now reached from step 6 instead.
+    await expect(page.getByRole("link", { name: /repository settings/i })).toBeVisible()
+
+    // The guard fired before any write: no blob/tree/commit/ref call ever happened.
+    const dataWriteCalls = calls.filter((c) => c.path.includes("/git/blobs") || c.path.includes("/git/trees") || c.path.includes("/git/commits") || c.path.includes("/git/refs"))
+    expect(dataWriteCalls).toEqual([])
+  })
 })

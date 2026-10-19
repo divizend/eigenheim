@@ -251,6 +251,34 @@ test("readAt reads the vault at a specific historical commit, without walking th
   ])
 })
 
+// Review finding 2 on Task 13 (src/ui/setup.ts): the fix two lines below guards against a bug
+// that ONLY manifests with a real browser's `fetch`, never Node's (confirmed live: Node's own
+// `fetch` tolerates an arbitrary `this` receiver; a real browser's does not, throwing `Failed to
+// execute 'fetch' on 'Window': Illegal invocation` when called as a bare property instead of on
+// its required global receiver) -- so every OTHER test in this file, which all construct
+// GithubStore with their own injected `fetch:` stub (an ordinary function, not receiver-sensitive
+// the way a real browser's is), would stay green even if this fix were reverted. This test
+// simulates the one thing that would actually catch a revert: a stand-in `fetch` that itself
+// enforces the real browser's receiver requirement, so this project's fast, no-network vitest
+// suite -- not only a ~6.5s Playwright run -- has a precise, immediate regression test for it.
+test("GithubStore's default fetch (no explicit override) is bound to its required global receiver", async () => {
+  const receiverSensitiveFetch = function (this: unknown): Promise<Response> {
+    if (this !== globalThis) {
+      return Promise.reject(new TypeError("Failed to execute 'fetch' on 'Window': Illegal invocation"))
+    }
+    return Promise.resolve(new Response(JSON.stringify([]), { status: 200, headers: { "content-type": "application/json" } }))
+  }
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = receiverSensitiveFetch as typeof fetch
+  try {
+    // No `fetch:` passed -- exercises GithubStore's own default branch, not a test-injected stub.
+    const store = new GithubStore(opts)
+    await expect(store.history(1)).resolves.toEqual([])
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
 test("ALL_ERROR_CLASSES lists exactly the eight named error classes, each constructible with no arguments", () => {
   // Task 7 amendment: Task 19's failure-recovery UI test enumerates this
   // array to prove every error class renders a visible way forward, so a

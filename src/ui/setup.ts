@@ -205,25 +205,12 @@ function renderTokenStep(root: HTMLElement, deps: Deps, state: WizardState): voi
       renderPassphraseStep(root, deps, state)
     } catch (err) {
       if (err instanceof RepoPublicError) {
-        const settingsUrl = `https://github.com/${repoOwner()}/${repoSlug()}/settings`
-        showFeedback(`
-          <p>${escapeHtml(err.message)} -- a private repository is required so the encrypted
-          file is never world-readable.</p>
-          <p><a href="${settingsUrl}" target="_blank" rel="noopener">Repository settings</a></p>
-          <button type="button" id="recheck-btn">Check again</button>
-        `)
+        showFeedback(`${errorRecoveryHtml(err)}<button type="button" id="recheck-btn">Check again</button>`)
         required<HTMLButtonElement>(root, "#recheck-btn").addEventListener("click", () => {
           void attemptValidate()
         })
-      } else if (err instanceof TokenError) {
-        showFeedback(`
-          <p>${escapeHtml(err.message)}</p>
-          <p>Follow the steps above again, or
-            <a href="${TOKEN_CREATE_URL}" target="_blank" rel="noopener">create a new token</a>.</p>
-        `)
-        continueBtn.disabled = tokenInput.value.trim().length === 0
       } else {
-        showFeedback(`<p>${escapeHtml(err instanceof Error ? err.message : String(err))}</p>`)
+        showFeedback(errorRecoveryHtml(err))
         continueBtn.disabled = tokenInput.value.trim().length === 0
       }
     }
@@ -240,6 +227,33 @@ function renderTokenStep(root: HTMLElement, deps: Deps, state: WizardState): voi
  * segments. */
 function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+}
+
+/** The message plus the one link that actually fixes `err`, shared between step 3's token
+ * validation and step 6's initialize attempt (review finding 3): `RepoPublicError`/`TokenError`
+ * can both recur at step 6 too -- e.g. the repo flips public again in the gap between step 3's
+ * check and clicking "Create my vault" at step 6 -- and spec §13's "a visible way forward"
+ * requirement does not expire after the first time an error type is shown. Returns HTML only,
+ * no button: step 3 appends its own "Check again" (which re-validates the token step's own
+ * fields); step 6 doesn't need an equivalent button, since its own "Create my vault" button is
+ * already re-clickable and re-runs the exact same attempt. */
+function errorRecoveryHtml(err: unknown): string {
+  if (err instanceof RepoPublicError) {
+    const settingsUrl = `https://github.com/${repoOwner()}/${repoSlug()}/settings`
+    return `
+      <p>${escapeHtml(err.message)} -- a private repository is required so the encrypted
+      file is never world-readable.</p>
+      <p><a href="${settingsUrl}" target="_blank" rel="noopener">Repository settings</a></p>
+    `
+  }
+  if (err instanceof TokenError) {
+    return `
+      <p>${escapeHtml(err.message)}</p>
+      <p>Follow the steps above again, or
+        <a href="${TOKEN_CREATE_URL}" target="_blank" rel="noopener">create a new token</a>.</p>
+    `
+  }
+  return `<p>${escapeHtml(err instanceof Error ? err.message : String(err))}</p>`
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -341,11 +355,53 @@ function renderSheetStep(root: HTMLElement, deps: Deps, state: WizardState): voi
 
 // ---------------------------------------------------------------------------------------------
 // Step 6: Initialize the data branch, then hand off to whatever src/main.ts does next (spec §9
-// step 5-6). Persists nothing to LocalStore until every network step below has actually
-// succeeded -- a failure partway through (bad network, a repo that flipped public again) must
-// never leave a wrapped identity in IndexedDB with no matching token/vault, which would make a
-// reload treat this device as already set up with no way to re-enter this wizard.
+// step 5-6).
 // ---------------------------------------------------------------------------------------------
+
+/** What {@link finishSetup} needs -- a narrower, explicit shape rather than {@link WizardState}
+ * itself, so a non-null `store` is a type-level guarantee instead of a runtime check this
+ * function has to repeat (the caller, which alone knows whether step 3 ever completed, performs
+ * that narrowing once before calling this). */
+export interface FinishSetupParams {
+  passphrase: string
+  token: string
+  store: GithubStore
+  identityPromise: Promise<{ identity: string; recipient: string }>
+}
+
+/** The actual work of step 6, extracted from the button click-handler so it is a plain,
+ * DOM-free `async function` a unit test can call directly (review finding 2 -- every step's real
+ * work used to live inline inside a DOM click-handler closure, which is why this project's only
+ * regression coverage for anything in this file was a 6.5s Playwright run). Initializes the data
+ * branch, wraps the device identity and token, and persists all three local writes -- in an order
+ * that is itself load-bearing, not incidental (review finding 1): `putWrappedIdentity` is written
+ * **last**, after `putToken` and `putCachedVault` have both durably landed, because
+ * `src/main.ts`'s only "is this device already set up" gate is `getWrappedIdentity() !== null`.
+ * `src/store/local.ts`'s `putSlot` opens a fresh IndexedDB transaction per call rather than
+ * sharing one across the three, so any failure after the first of these writes (quota, tab
+ * closed, power loss -- no network involved) can strand a device mid-sequence; writing the gating
+ * value last means that failure always leaves `getWrappedIdentity()` null, so a reload cleanly
+ * re-enters this wizard instead of being stuck with a routing gate that says "already set up" and
+ * nothing valid to unlock with. Persists nothing at all until `initializeDataBranch` has actually
+ * succeeded, for the same reason, one step earlier.
+ *
+ * Sequential throughout, never `Promise.all`: this project's own Global Constraint is that the
+ * two scrypt runs (encrypting the empty vault, wrapping the device identity) must never be
+ * concurrent (spec §5.4). */
+export async function finishSetup(params: FinishSetupParams, local: LocalStore): Promise<Session> {
+  const armored = await encryptVault("", params.passphrase)
+  const { sha } = await params.store.initializeDataBranch({ armored })
+
+  const { identity, recipient } = await params.identityPromise
+  const wrappedIdentity = await wrapIdentity(identity, params.passphrase)
+  const wrappedToken = await encryptToRecipient(params.token, recipient)
+
+  await local.putToken(wrappedToken)
+  await local.putCachedVault({ armored, sha })
+  await local.putWrappedIdentity(wrappedIdentity)
+
+  return { text: "", baseSha: sha, token: params.token, identity, passphrase: params.passphrase }
+}
 
 function renderInitializeStep(root: HTMLElement, deps: Deps, state: WizardState): void {
   root.innerHTML = shell(
@@ -369,25 +425,17 @@ function renderInitializeStep(root: HTMLElement, deps: Deps, state: WizardState)
       feedback.hidden = true
       try {
         if (!state.store) throw new Error("setup wizard: no GitHub store -- the token step never completed")
-
-        // Sequential, never Promise.all: this project's own Global Constraint is that the two
-        // scrypt runs (here, encrypting the empty vault and wrapping the device identity) must
-        // never be concurrent (spec §5.4).
-        const armored = await encryptVault("", state.passphrase)
-        const { sha } = await state.store.initializeDataBranch({ armored })
-
-        const { identity, recipient } = await state.identityPromise
-        const wrappedIdentity = await wrapIdentity(identity, state.passphrase)
-        await deps.local.putWrappedIdentity(wrappedIdentity)
-
-        const wrappedToken = await encryptToRecipient(state.token, recipient)
-        await deps.local.putToken(wrappedToken)
-
-        await deps.local.putCachedVault({ armored, sha })
-
-        deps.onComplete({ text: "", baseSha: sha, token: state.token, identity, passphrase: state.passphrase })
+        const session = await finishSetup(
+          { passphrase: state.passphrase, token: state.token, store: state.store, identityPromise: state.identityPromise },
+          deps.local,
+        )
+        deps.onComplete(session)
       } catch (err) {
-        feedback.textContent = err instanceof Error ? err.message : String(err)
+        // Review finding 3: reuse step 3's own rich RepoPublicError/TokenError handling here too
+        // -- the repo can flip public again, or the token can be revoked, in the gap between
+        // step 3's check and clicking "Create my vault", and spec §13's "visible way forward"
+        // applies on every occurrence, not just the first.
+        feedback.innerHTML = errorRecoveryHtml(err)
         feedback.hidden = false
         finishBtn.disabled = false
       }

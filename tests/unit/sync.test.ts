@@ -674,8 +674,11 @@ test("the queue can drain multiple entries in one call as independent commits wh
 
 test("replay stops at the first conflict, leaving any later queued entries untouched for a future call", async () => {
   // Explicit 20s timeout (vitest's default is 5s): this test's own setup plus replay path runs
-  // SEVEN sequential logN=17 scrypt operations by construction (encryptVault x5 across the setup
-  // and fixtures, decryptVault x2 inside the conflict path) -- never concurrently, per this
+  // NINE sequential logN=17 scrypt operations by construction -- encryptVault x5 across the
+  // setup and fixtures (three enqueued entries plus the two readHeadFixtures/
+  // commitTreeBlobFixtures armored fixtures), decryptVault x4 inside replay itself
+  // (replayPendingCommits' own per-entry `mineText` decrypt, once each for "A" and "B", plus
+  // attemptWrite's two conflict-path decrypts for "theirs"/"base") -- never concurrently, per this
   // project's own Global Constraint (spec §5.4) -- which this box's shared, cgroup-throttled CPU
   // (confirmed live: `cat /sys/fs/cgroup/cpu.max` reports a 12-core quota against `nproc`'s 16,
   // and `cpu.stat`'s nr_throttled/throttled_usec are both nonzero) can push past 5s under
