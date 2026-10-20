@@ -22,9 +22,16 @@ export default defineConfig({
     ...devices["Desktop Chrome"],
   },
   webServer: {
+    // `--host 127.0.0.1` is load-bearing, not tidiness. `vite preview` binds `localhost` by
+    // default, and on a GitHub Actions runner `localhost` resolves to ::1 first -- so the server
+    // listened on IPv6 only while Playwright polled the IPv4 `127.0.0.1` in `url` below, and the
+    // start check never succeeded. It surfaced as "Timed out waiting from config.webServer" with
+    // no server output, which looks exactly like a slow build: raising the timeout from 120s to
+    // 300s changed nothing, which is what ruled that explanation out. Binding the same literal
+    // address Playwright probes removes the resolution step entirely.
     // Always rebuilds before serving, so a stale dist/ from an earlier task is never what the
     // suite actually exercises.
-    command: "npm run build && npm run preview -- --port 4173 --strictPort",
+    command: "npm run build && npm run preview -- --host 127.0.0.1 --port 4173 --strictPort",
     url: "http://127.0.0.1:4173",
     reuseExistingServer: !process.env.CI,
     // 300s, not Playwright's 60s default and not the 120s this started at. Raised after the
