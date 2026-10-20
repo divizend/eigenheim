@@ -14,7 +14,8 @@
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "test:e2e": "playwright test",
     "test:interop": "vitest run --config vitest.interop.config.ts",
-    "capture:screenshots": "node --experimental-strip-types scripts/capture-screenshots.ts"
+    "capture:screenshots": "node --experimental-strip-types scripts/capture-screenshots.ts",
+    "test:acceptance": "./scripts/acceptance.sh"
   },
   "dependencies": {
     "age-encryption": "0.3.1",

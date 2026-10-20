@@ -237,13 +237,25 @@ export function renderHistory(root: HTMLElement, deps: HistoryDeps): void {
   }
 
   void (async () => {
+    // A placeholder while the commit list is in flight. Without it the list is simply empty for
+    // as long as GitHub takes to answer, which is indistinguishable from "this vault has no
+    // history" -- a momentary lie about the user's own data.
+    const loading = document.createElement("li")
+    loading.className = "history-loading"
+    loading.dataset.testid = "history-loading"
+    loading.textContent = "Loading versions…"
+    list.append(loading)
+
     let entries: HistoryEntry[]
     try {
       entries = await store.history(HISTORY_PAGE)
     } catch (err) {
+      loading.remove()
       fail(`History could not be read from GitHub: ${err instanceof Error ? err.message : String(err)}`)
       return
     }
+
+    loading.remove()
 
     if (entries.length === 0) {
       detail.replaceChildren()

@@ -841,3 +841,13 @@ body:has(.update-prompt) {
   border-color: var(--accent-border);
   color: var(--accent);
 }
+
+/* Shown while the commit list is in flight (src/ui/history.ts). An empty list is
+   indistinguishable from "this vault has no history", which is a momentary lie about the
+   user's own data. */
+.history-loading {
+  padding: 10px 12px;
+  font-family: var(--sans);
+  font-size: 13px;
+  color: var(--text);
+}

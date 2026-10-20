@@ -280,6 +280,26 @@ test("GithubStore's default fetch (no explicit override) is bound to its require
   }
 })
 
+test("every request bypasses the browser HTTP cache", async () => {
+  // Found by the spec §14 acceptance run against real GitHub: GitHub answers authenticated
+  // reads with `Cache-Control: private, max-age=60`, so without this a browser may serve a
+  // minute-old copy of `GET /git/ref/heads/data` -- a MUTABLE pointer. The observed symptom was
+  // a conflict view whose "theirs" pane showed the version from BEFORE the other device's save,
+  // while a direct API read in the same test proved GitHub already held the newer one.
+  const seen: Array<RequestCache | undefined> = []
+  const store = new GithubStore({
+    ...opts,
+    fetch: (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      seen.push(init?.cache)
+      return new Response(JSON.stringify([]), { status: 200, headers: { "content-type": "application/json" } })
+    }) as typeof fetch,
+  })
+  await store.history(1)
+
+  expect(seen.length).toBeGreaterThan(0)
+  for (const cache of seen) expect(cache).toBe("no-store")
+})
+
 test("ALL_ERROR_CLASSES lists exactly the nine named error classes, each constructible with no arguments", () => {
   // Task 7 amendment: Task 19's failure-recovery UI test enumerates this
   // array to prove every error class renders a visible way forward, so a

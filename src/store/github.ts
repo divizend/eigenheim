@@ -350,6 +350,20 @@ export class GithubStore {
     for (let attempt = 0; ; attempt++) {
       const res = await this.fetchFn(`${API_BASE}${path}`, {
         method,
+        // `no-store` on EVERY request, including GETs. Found by the spec §14 acceptance run
+        // against real GitHub, not by inspection: GitHub answers authenticated reads with
+        // `Cache-Control: private, max-age=60`, so a browser is entitled to serve a 60-second-old
+        // copy of `GET /git/ref/heads/data` -- a MUTABLE pointer. The symptom was a conflict
+        // view whose "theirs" pane showed the version before the other device's save, while a
+        // direct API read in the same test proved GitHub already held the newer one.
+        //
+        // Applied to everything rather than only to the mutable paths, deliberately. The
+        // alternative is a classification -- refs and commit LISTS are mutable, blobs/trees/
+        // commits are content-addressed and immutable -- that has to be re-derived correctly by
+        // every future person who adds an endpoint, and silently returns stale data when they
+        // get it wrong. The saving it would buy is a few KB of JSON on a view a user opens by
+        // hand. Correctness is worth more here than the cache is.
+        cache: "no-store",
         headers: {
           Authorization: `Bearer ${this.token}`,
           "X-GitHub-Api-Version": API_VERSION,
