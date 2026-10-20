@@ -47,6 +47,19 @@ test("the bare unit suite CI runs cannot reach the token- or binary-gated suites
   expect(base).toContain('include: ["tests/unit/**/*.test.ts"]')
 })
 
+test("the build-hash guard stages before comparing, so it cannot skip a NEW file", () => {
+  // `git diff --quiet -- <path>` compares the working tree against the INDEX, and an untracked
+  // file is in neither -- so it answers "no change" for a file that has never been committed.
+  // The first version of this workflow used exactly that, and silently skipped every
+  // publication: the job went green, printed "unchanged; nothing to commit", and
+  // build-hash.txt was a 404 on main. Caught on the real repository, not in review.
+  const commit = /Commit build-hash\.txt[\s\S]*?(?=\n  \w|$)/.exec(CI)?.[0] ?? ""
+  expect(commit).toContain("git add build-hash.txt")
+  expect(commit).toContain("git diff --cached --quiet")
+  // The staging must come BEFORE the comparison, which is the whole point.
+  expect(commit.indexOf("git add build-hash.txt")).toBeLessThan(commit.indexOf("git diff --cached --quiet"))
+})
+
 test("the build hash is published from main only, and never loops", () => {
   // A hash published from a branch would describe a bundle nobody serves; and a commit that
   // re-triggers CI would republish forever.

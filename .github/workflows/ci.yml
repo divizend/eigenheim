@@ -140,11 +140,18 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if git diff --quiet -- build-hash.txt; then
+          # STAGE FIRST, then compare the index. `git diff --quiet -- <path>` compares the
+          # working tree against the INDEX, and an untracked file is in neither -- so it reports
+          # "no change" and this guard silently skipped every publication, including the very
+          # first one. Caught on the real repo: the job went green, said "unchanged; nothing to
+          # commit", and build-hash.txt was a 404 on main. `--cached` compares the index against
+          # HEAD, which is the question actually being asked ("is this different from what is
+          # committed?") and is correct for a new file and a changed one alike.
+          git add build-hash.txt
+          if git diff --cached --quiet -- build-hash.txt; then
             echo "build-hash.txt unchanged; nothing to commit."
             exit 0
           fi
-          git add build-hash.txt
           # [skip ci] so publishing a hash does not trigger a run that republishes it.
           git commit -m "ci: publish build hash for ${GITHUB_SHA::7} [skip ci]"
           git push
