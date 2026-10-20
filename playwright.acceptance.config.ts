@@ -20,7 +20,7 @@ export default defineConfig({
     command: "npm run build && npm run preview -- --port 4288 --strictPort",
     url: "http://127.0.0.1:4288",
     reuseExistingServer: false,
-    timeout: 180_000,
+    timeout: 300_000,
     env: {
       VERCEL_GIT_REPO_OWNER: process.env.EIGENHEIM_ACCEPTANCE_OWNER ?? "",
       VERCEL_GIT_REPO_SLUG: process.env.EIGENHEIM_ACCEPTANCE_REPO ?? "",

@@ -86,8 +86,14 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npx playwright install --with-deps chromium
-      # Builds first (playwright.config.ts's webServer does it), so this also proves the
-      # production bundle -- not a dev server -- is what the suite exercised.
+      # Built as its own step, deliberately. playwright.config.ts's webServer builds too, so
+      # this is not strictly required -- but on a cold runner that build is slow enough to have
+      # blown the webServer's own start timeout, which surfaces as an opaque "timed out waiting
+      # from config.webServer" with no build output at all. Doing it here means a real build
+      # failure reads as a build failure, and leaves `.tsbuildinfo` warm so the webServer's
+      # rebuild is incremental.
+      - run: npm run build
+      # The suite still runs against the production bundle via `vite preview`, not a dev server.
       - run: npm run test:e2e
       - uses: actions/upload-artifact@v4
         if: failure()

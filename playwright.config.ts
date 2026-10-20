@@ -27,6 +27,13 @@ export default defineConfig({
     command: "npm run build && npm run preview -- --port 4173 --strictPort",
     url: "http://127.0.0.1:4173",
     reuseExistingServer: !process.env.CI,
-    timeout: 120_000,
+    // 300s, not Playwright's 60s default and not the 120s this started at. Raised after the
+    // first real CI run timed out here with no error output at all: a cold GitHub Actions
+    // runner has no `.tsbuildinfo` and no Vite cache, so `tsc -b` across all three composite
+    // projects plus a full bundle exceeded 120s on its own. CI additionally runs `npm run
+    // build` as its own step first, which makes the incremental rebuild here fast and, more
+    // usefully, makes a genuine BUILD failure show up as a build failure rather than as this
+    // opaque "timed out waiting from config.webServer".
+    timeout: 300_000,
   },
 })
