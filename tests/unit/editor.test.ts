@@ -562,3 +562,29 @@ test("the operation queue runs in order and a rejected operation does not poison
   expect(await second).toBe("ok")
   expect(order).toEqual(["first", "second"])
 })
+
+test("a successful save does not make the notice echo the indicator", async () => {
+  const { commitNotice } = await import("../../src/ui/editor")
+  // Reported from a real deployment: the footer read "Saved to GitHub   Saved to GitHub."
+  // because the indicator and the notice both said it. The notice is for what the indicator
+  // CANNOT express, so on success it must be silent.
+  expect(commitNotice({ kind: "committed", sha: "abc" })).toBeNull()
+})
+
+test("every save outcome the indicator cannot express still says something", async () => {
+  const { commitNotice, indicatorLabel } = await import("../../src/ui/editor")
+  const outcomes = [
+    { kind: "conflict" as const, conflict: {} as never },
+    { kind: "queued" as const },
+    { kind: "no-token" as const },
+    { kind: "failed" as const, message: "boom" },
+  ]
+  for (const outcome of outcomes) {
+    const notice = commitNotice(outcome)
+    expect(notice, `${outcome.kind} says nothing at all`).not.toBeNull()
+    // And none of them merely restates one of the three indicator labels.
+    for (const state of ["committed", "local-only", "offline"] as const) {
+      expect(notice).not.toBe(indicatorLabel(state))
+    }
+  }
+})

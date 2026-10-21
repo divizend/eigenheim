@@ -243,10 +243,21 @@ test.describe("settings", () => {
     expect(await decryptVault(cached.armored, NEW_PASS)).toBe(TEXT)
 
     // And the new passphrase really is what unlocks this device from cold.
+    //
+    // Note the reload happens at /settings, so this also pins the routing property: the gate
+    // outranks the URL (unlock is shown first), and the requested route survives it (settings
+    // comes back afterwards, not the editor). A deep link that silently dropped you somewhere
+    // else after unlocking would make the URL a lie.
     await page.reload()
+    expect(new URL(page.url()).pathname).toBe("/settings")
     await page.getByLabel(/passphrase/i).fill(NEW_PASS)
     await page.getByRole("button", { name: /^unlock$/i }).click()
+    await expect(page.getByTestId("reveal-qr")).toBeVisible({ timeout: 60_000 })
+
+    // The vault itself still opens on the new passphrase, from the editor.
+    await page.getByRole("button", { name: /back to the editor/i }).click()
     await expect(page.getByTestId("editor")).toHaveValue(TEXT, { timeout: 60_000 })
+    expect(new URL(page.url()).pathname).toBe("/")
   })
 
   test("displays the running build and says plainly that a dev build cannot be verified", async ({ page }) => {

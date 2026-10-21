@@ -39,15 +39,41 @@ export const DATA_BRANCH = "data"
 /** The GitHub account that owns this deployment's repo. Baked in at build
  * time from Vercel's `VERCEL_GIT_REPO_OWNER`; the user is never asked to
  * type it (spec §9.2). Falls back to "test-owner" when unset. */
+/** A repository chosen at runtime, overriding the build-time default. Set once at startup by
+ * src/main.ts from `LocalStore.getRepo()`, and again by Settings when the user changes it.
+ *
+ * Module-level rather than threaded through every call site, deliberately: `repoOwner()` and
+ * `repoSlug()` are read from a dozen places across the UI, the store and the transfer payload,
+ * and every one of them wants the SAME answer at any given moment. Passing it around would
+ * create the possibility of two call sites disagreeing, which is exactly the bug class this
+ * avoids. It is set before anything renders, so no view ever observes it changing underneath
+ * itself — Settings reloads the page after a change rather than mutating it live, because the
+ * cached vault and the open session both belong to the old repository. */
+let runtimeRepo: { owner: string; slug: string } | null = null
+
+/** Applies a runtime repository override. Passing `null` reverts to the build-time default. */
+export function setRuntimeRepo(repo: { owner: string; slug: string } | null): void {
+  runtimeRepo = repo
+}
+
+/** The deployment's own build-time default, before any runtime override — what Settings shows
+ * as "the repository this deployment was built for", and what a reset returns to. */
+export function builtInRepo(): { owner: string; slug: string } {
+  return {
+    owner: typeof __REPO_OWNER__ === "undefined" ? "test-owner" : __REPO_OWNER__,
+    slug: typeof __REPO_SLUG__ === "undefined" ? "test-repo" : __REPO_SLUG__,
+  }
+}
+
 export function repoOwner(): string {
-  return typeof __REPO_OWNER__ === "undefined" ? "test-owner" : __REPO_OWNER__
+  return runtimeRepo?.owner ?? builtInRepo().owner
 }
 
 /** The GitHub repo slug of this deployment. Baked in at build time from
  * Vercel's `VERCEL_GIT_REPO_SLUG` (spec §9.2). Falls back to "test-repo"
  * when unset. */
 export function repoSlug(): string {
-  return typeof __REPO_SLUG__ === "undefined" ? "test-repo" : __REPO_SLUG__
+  return runtimeRepo?.slug ?? builtInRepo().slug
 }
 
 /** The git commit SHA this bundle was built from, baked in at build time

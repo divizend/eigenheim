@@ -2,7 +2,7 @@ import "./style.css"
 import "./ui/views.css"
 import { LocalStore } from "./store/local"
 import { GithubStore } from "./store/github"
-import { repoOwner, repoSlug } from "./config"
+import { repoOwner, repoSlug, setRuntimeRepo } from "./config"
 import { renderSetup } from "./ui/setup"
 import { renderUnlock } from "./ui/unlock"
 import { renderEditor } from "./ui/editor"
@@ -11,6 +11,7 @@ import { renderHistory } from "./ui/history"
 import { renderSettings } from "./ui/settings"
 import { renderFailure } from "./ui/errors"
 import { watchForUpdates } from "./ui/update"
+import { startRouter, type Route } from "./ui/router"
 import type { Session } from "./session/unlock"
 
 /** The one place a `GithubStore` is constructed from a token (ruling R3's seam, used identically
@@ -21,51 +22,67 @@ function makeStore(token: string): GithubStore {
   return new GithubStore({ owner: repoOwner(), repo: repoSlug(), token })
 }
 
-/** Mounts the editor on an unlocked session.
+/** Mounts whichever view the URL names, for an unlocked session.
  *
- * `onConflict` hands off to the three-way view (task 15). The editor has already kept the user's
- * text on screen and persisted the draft before calling this, so the handoff never depends on
- * the conflict view succeeding -- and the conflict view, on resolving, calls `reopen` with the
- * settled text, which re-mounts this editor on it. */
-function openEditor(root: HTMLElement, local: LocalStore, session: Session): void {
-  renderEditor(root, {
-    local,
-    makeStore,
-    session,
-    onConflict: (conflict, reopen) => {
-      renderConflict(root, {
-        conflict,
+ * Every view navigates by calling `go(route)` rather than rendering another view directly, so
+ * the address bar and what is on screen cannot disagree — which is the whole point of having
+ * routing at all. Back/Forward work for free, and a reload or a shared link lands where it says.
+ *
+ * One session object exists per unlock and every view shares it, mutated in place — never a
+ * `{...session}` copy. `resolveConflict`, `restoreVersion` and `changePassphrase` all advance
+ * fields on it, so a copy taken here would fork identity with whatever still holds the original
+ * and let the two drift. */
+function openApp(root: HTMLElement, local: LocalStore, session: Session): void {
+  const io = { local, makeStore }
+
+  const go = startRouter({
+    render: (route: Route) => {
+      if (route === "settings") {
+        renderSettings(root, {
+          session,
+          io,
+          text: session.text,
+          onClose: () => go("editor"),
+          // A reload, not a re-render: the open session, the cached vault and every view on
+          // screen all belong to the repository that was just replaced.
+          onRepoChanged: () => window.location.reload(),
+          makeStoreFor: (owner, repo, token) => new GithubStore({ owner, repo, token }),
+        })
+        return
+      }
+
+      if (route === "history") {
+        renderHistory(root, {
+          session,
+          io,
+          onClose: (resolved) => {
+            session.text = resolved
+            go("editor")
+          },
+        })
+        return
+      }
+
+      renderEditor(root, {
+        local,
+        makeStore,
         session,
-        io: { local, makeStore },
-        onResolved: (text) => reopen(text),
-      })
-    },
-    onOpenSettings: (text) => {
-      session.text = text
-      renderSettings(root, {
-        session,
-        io: { local, makeStore },
-        text,
-        // `changePassphrase` may have advanced `session.text`/`baseSha`/`passphrase` in place,
-        // so the editor re-opens on the session rather than on the `text` captured above.
-        onClose: () => openEditor(root, local, session),
-      })
-    },
-    onOpenHistory: (text) => {
-      // History diffs against what is ON SCREEN, so the session carries the unsaved text across
-      // -- otherwise "what would restoring change" would answer a question about the last
-      // committed version rather than the one the user is looking at.
-      session.text = text
-      renderHistory(root, {
-        session,
-        io: { local, makeStore },
-        onClose: (resolved) => {
-          // The SAME session object, mutated -- never a `{...session}` copy. `resolveConflict`
-          // and `restoreVersion` both advance `session.baseSha` in place, so a copy taken here
-          // would fork identity with whatever still holds the original and let the two drift.
-          // One session object exists per unlock, and every view shares it.
-          session.text = resolved
-          openEditor(root, local, session)
+        onConflict: (conflict, reopen) => {
+          // Deliberately NOT a route: a conflict is a modal interruption of one save, not a
+          // place in the app. Giving it a URL would let a reload or a shared link land on a
+          // conflict whose two sides no longer exist.
+          renderConflict(root, { conflict, session, io, onResolved: (text) => reopen(text) })
+        },
+        onOpenSettings: (text) => {
+          session.text = text
+          go("settings")
+        },
+        onOpenHistory: (text) => {
+          // History diffs against what is ON SCREEN, so the session carries the unsaved text
+          // across — otherwise "what would restoring change" would answer a question about the
+          // last committed version rather than the one the user is looking at.
+          session.text = text
+          go("history")
         },
       })
     },
@@ -84,17 +101,26 @@ async function main(): Promise<void> {
 
   const local = new LocalStore()
 
+  // BEFORE anything renders or any store is built: `repoOwner()`/`repoSlug()` are read from a
+  // dozen places, and every one of them must already see the repository this device actually
+  // points at rather than the deployment's build-time default.
+  const storedRepo = await local.getRepo()
+  if (storedRepo) setRuntimeRepo(storedRepo)
+
   // The ONE gate that decides setup-vs-unlock, and the reason src/ui/setup.ts writes
   // `putWrappedIdentity` LAST (ruling R27): a device that failed partway through setup must
   // leave this null, so it re-enters the wizard rather than landing on an unlock view with
   // nothing valid to unlock and no recovery key to fall back on.
   const wrappedIdentity = await local.getWrappedIdentity()
 
+  // Setup and unlock outrank the URL: a deep link to /settings on a locked or un-set-up device
+  // must still land on the gate, not on a view that has no session behind it. The requested
+  // route is reached only after `openApp` starts the router, which re-reads the URL then.
   if (wrappedIdentity === null) {
     renderSetup(root, {
       local,
       makeStore,
-      onComplete: (session) => openEditor(root, local, session),
+      onComplete: (session) => openApp(root, local, session),
     })
     return
   }
@@ -102,7 +128,7 @@ async function main(): Promise<void> {
   renderUnlock(root, {
     local,
     makeStore,
-    onUnlocked: (session) => openEditor(root, local, session),
+    onUnlocked: (session) => openApp(root, local, session),
   })
 }
 

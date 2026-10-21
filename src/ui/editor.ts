@@ -351,6 +351,28 @@ export function indicatorLabel(s: SaveState): string {
   return "Offline — editing continues"
 }
 
+/** What the notice line should say for a save outcome — or `null` to say nothing.
+ *
+ * `committed` returns null deliberately. The indicator beside this notice already reads "Saved
+ * to GitHub", so a notice saying the same thing rendered the footer as
+ * "Saved to GitHub   Saved to GitHub." — reported from a real deployment. The notice exists for
+ * what the indicator CANNOT express (a conflict, a queued save, a failure); when the indicator
+ * already carries the whole message, the notice must be silent rather than echo it. */
+export function commitNotice(outcome: CommitOutcome): string | null {
+  switch (outcome.kind) {
+    case "committed":
+      return null
+    case "conflict":
+      return "Another device saved a newer version of this vault. Your text is still here and saved on this device; the two versions have to be merged before it can go to GitHub."
+    case "queued":
+      return "GitHub could not be reached, so this save is queued on this device and will be sent when the connection comes back."
+    case "no-token":
+      return "This device has no GitHub token stored, so it can only save locally. The text is safe on this device."
+    case "failed":
+      return `Could not save to GitHub: ${outcome.message}`
+  }
+}
+
 /** Whether a background sync's newer text may replace what is on screen.
  *
  * `syncFromRemote` already refuses to adopt anything when a local draft exists, but there is a
@@ -473,7 +495,7 @@ export function renderEditor(root: HTMLElement, deps: EditorDeps): void {
     if (outcome.kind === "committed") {
       dirty = false
       paint()
-      say("Saved to GitHub.")
+      say(commitNotice(outcome))
       return
     }
     if (outcome.kind === "conflict") {

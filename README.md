@@ -72,12 +72,29 @@ not a theoretical one, and it is why:
   control;
 - and the escape hatch above exists, so your data outlives any judgement you make about this app.
 
+> **If you deployed with the button, that hash check will say it cannot verify anything — and
+> that is worth fixing.** Vercel's GitHub App is not allowed to write workflow files, so the
+> repository it creates for you gets every file in this template *except* `.github/workflows/`.
+> The job that publishes `build-hash.txt` therefore never runs in your repository, and there is
+> nothing for the app to compare the running bundle against. To turn the check on, copy
+> `.github/workflows/ci.yml` from this repository into yours and push once. (The `build-hash.txt`
+> that came with the clone is this template's, for a different commit, so it is not a substitute.)
+
 Also not protected: anyone with your unlocked device, and anyone who learns your passphrase.
 There is no second factor, because there is no server to enforce one against.
 
 **There is no recovery.** No password reset, no recovery key, no support address that can help.
 If you forget the passphrase, the data is gone. That is the cost of nobody else being able to
 read it.
+
+## Where your vault is stored
+
+By default it is the repository this app was deployed from — it knows its own name, so you are
+never asked to type it. **Settings → Where your vault is stored** shows which repository that is,
+links straight to the encrypted file on GitHub so you can look at the ciphertext yourself, and
+lets you point this device at a different repository. Changing it keeps your passphrase, your
+device identity and your token; it only changes where the file lives. It refuses while you have
+unsaved text, because that text belongs to the vault you are moving away from.
 
 ## Adding a second device
 

@@ -171,7 +171,17 @@
    should recognise the page they set up, not meet a differently-shaped app.
    --------------------------------------------------------------------------------------------- */
 
+/* `width: 100%` on every centred view container, not just `max-width`.
+   Without a definite width these are shrink-to-fit inside #app's flex column, so the container
+   -- and therefore the heading and everything else in it -- moves horizontally whenever its
+   CONTENT changes width. Reported from a real deployment as the History heading and left column
+   jumping the moment the detail pane swapped "Decrypting this version…" for a diff; measured
+   here at a 38px shift, with #app and the viewport both unchanged, which is what ruled out a
+   scrollbar. A definite width makes the layout independent of content, which is the property
+   every one of these views wants. */
 .unlock {
+  width: 100%;
+  box-sizing: border-box;
   max-width: 640px;
   margin: 0 auto;
   padding: 64px 24px;
@@ -290,6 +300,8 @@
    --------------------------------------------------------------------------------------------- */
 
 .conflict {
+  width: 100%;
+  box-sizing: border-box;
   max-width: 1000px;
   margin: 0 auto;
   padding: 40px 24px 64px;
@@ -421,6 +433,8 @@
    --------------------------------------------------------------------------------------------- */
 
 .history {
+  width: 100%;
+  box-sizing: border-box;
   max-width: 1100px;
   margin: 0 auto;
   padding: 32px 24px 64px;
@@ -453,9 +467,16 @@
 
 .history-body {
   display: grid;
-  grid-template-columns: minmax(220px, 300px) 1fr;
+  /* `280px minmax(0, 1fr)`, not `minmax(220px,300px) 1fr`. A bare `1fr` track is
+     `minmax(auto, 1fr)`, so its AUTO minimum lets wide content -- a diff line longer than the
+     pane -- push the track wider and steal width from the list beside it. Reported from a real
+     deployment as the heading and the left column visibly jumping the moment "Decrypting this
+     version…" was replaced by the diff. A fixed first track plus a `minmax(0, 1fr)` second one
+     makes the layout independent of what the detail pane happens to contain. */
+  grid-template-columns: 280px minmax(0, 1fr);
   gap: 24px;
   margin-top: 20px;
+  align-items: start;
 }
 
 @media (max-width: 760px) {
@@ -500,6 +521,12 @@
 .history-what {
   font-size: 12px;
   color: var(--text);
+}
+
+/* Reserves the pane's own height so swapping a one-line status for a tall diff does not move
+   anything above it either -- the vertical half of the same jump. */
+.history-detail {
+  min-height: 320px;
 }
 
 .history-detail h2 {
@@ -559,6 +586,8 @@
    --------------------------------------------------------------------------------------------- */
 
 .settings {
+  width: 100%;
+  box-sizing: border-box;
   max-width: 720px;
   margin: 0 auto;
   padding: 32px 24px 64px;
@@ -725,6 +754,8 @@
    --------------------------------------------------------------------------------------------- */
 
 .failure {
+  width: 100%;
+  box-sizing: border-box;
   max-width: 640px;
   margin: 0 auto;
   padding: 64px 24px;
@@ -850,4 +881,31 @@ body:has(.update-prompt) {
   font-family: var(--sans);
   font-size: 13px;
   color: var(--text);
+}
+
+/* The "store it elsewhere" disclosure inside Settings. A disclosure rather than a visible form:
+   changing where the vault lives is rare and consequential, and it should not sit at the same
+   visual weight as the link that merely shows you the file. */
+.settings-advanced {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.settings-advanced summary {
+  cursor: pointer;
+  color: var(--accent);
+  font-size: 14px;
+}
+
+.settings-advanced button {
+  font-family: var(--sans);
+  font-size: 14px;
+  padding: 8px 16px;
+  margin-top: 12px;
+  border-radius: 6px;
+  border: 2px solid var(--border);
+  background: var(--bg);
+  color: var(--text-h);
+  cursor: pointer;
 }

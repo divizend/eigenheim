@@ -252,3 +252,122 @@ test("unverifiable and mismatch are distinct outcomes, never collapsed", () => {
   ])
   expect(kinds).toEqual(new Set(["unverifiable"]))
 })
+
+test("the vault link points at the encrypted file on the data branch", async () => {
+  const { vaultFileUrl } = await import("../../src/ui/settings")
+  // The one place the UI shows the user, in GitHub's own interface, that what is stored really
+  // is ciphertext.
+  expect(vaultFileUrl()).toBe(`https://github.com/${OWNER}/${REPO}/blob/data/vault.age`)
+})
+
+test("changing the repository is refused while unsaved text exists", async () => {
+  const { changeRepo } = await import("../../src/ui/settings")
+  const { encryptToRecipient } = await import("../../src/vault/crypto")
+  const { recipientFor } = await import("../../src/vault/identity")
+  const local = new LocalStore()
+  const session = await sessionFor()
+  await local.putDraft({
+    armored: await encryptToRecipient("unsaved work\n", await recipientFor(session.identity)),
+    baseSha: "sha-current",
+    savedAt: Date.now(),
+  })
+
+  const outcome = await changeRepo("other", "repo", session, { local, makeStore: storeWith({ ok: true }) }, () => {
+    throw new Error("must not validate a repository while a draft exists")
+  })
+
+  // The draft is text the user typed and never committed, and it belongs to the OLD vault.
+  // Carrying it over or discarding it would both lose or corrupt something.
+  expect(outcome).toEqual({ kind: "unsaved-draft" })
+  expect(await local.getRepo()).toBeNull()
+})
+
+test("a repository that fails validation is never stored", async () => {
+  const { changeRepo } = await import("../../src/ui/settings")
+  const local = new LocalStore()
+  const session = await sessionFor()
+
+  const outcome = await changeRepo("other", "repo", session, { local, makeStore: storeWith({ ok: true }) }, (_o, _r, t) =>
+    storeWith({ ok: false })(t),
+  )
+
+  expect(outcome.kind).toBe("rejected")
+  expect(await local.getRepo()).toBeNull()
+  // And the app still points where it did.
+  expect(repoOwner()).toBe(OWNER)
+})
+
+test("a validated repository is stored, takes effect immediately, and drops the old cached vault", async () => {
+  const { changeRepo } = await import("../../src/ui/settings")
+  const { setRuntimeRepo } = await import("../../src/config")
+  const local = new LocalStore()
+  const session = await sessionFor()
+  await local.putCachedVault({ armored: "old repo ciphertext", sha: "sha-old" })
+
+  try {
+    const outcome = await changeRepo("new-owner", "new-repo", session, { local, makeStore: storeWith({ ok: true }) }, (_o, _r, t) =>
+      storeWith({ ok: true })(t),
+    )
+    expect(outcome).toEqual({ kind: "changed" })
+    expect(await local.getRepo()).toEqual({ owner: "new-owner", slug: "new-repo" })
+    expect(repoOwner()).toBe("new-owner")
+    expect(repoSlug()).toBe("new-repo")
+    // The cached ciphertext belonged to the previous repository; keeping it would make the next
+    // unlock decrypt the wrong vault.
+    expect(await local.getCachedVault()).toBeNull()
+  } finally {
+    setRuntimeRepo(null)
+  }
+})
+
+test("whitespace and obviously-wrong repository names are refused before any network call", async () => {
+  const { changeRepo } = await import("../../src/ui/settings")
+  const local = new LocalStore()
+  const session = await sessionFor()
+  const never = () => {
+    throw new Error("must not reach the network for an obviously invalid name")
+  }
+  for (const [owner, slug] of [["", "repo"], ["owner", ""], ["own er", "repo"], ["owner", "re/po"]]) {
+    const outcome = await changeRepo(owner, slug, session, { local, makeStore: storeWith({ ok: true }) }, never)
+    expect(outcome.kind, `${owner}/${slug} was not refused`).toBe("rejected")
+  }
+})
+
+test("the published hash is read through the API, so a PRIVATE repository can be verified", async () => {
+  const { fetchPublishedHash } = await import("../../src/ui/settings")
+  // Reported from a live private deployment reading "Cannot verify the running code": the
+  // original read raw.githubusercontent.com, which 404s for a private repo -- and this design
+  // REQUIRES the repo to be private, so the check could never succeed on a real deployment.
+  const seen: Array<{ url: string; auth: string | undefined }> = []
+  const body = "abc1234 " + "a".repeat(64) + "\n"
+  const impl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+    seen.push({ url, auth: (init?.headers as Record<string, string> | undefined)?.Authorization })
+    return new Response(JSON.stringify({ content: btoa(body), encoding: "base64" }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    })
+  }) as unknown as typeof fetch
+
+  expect(await fetchPublishedHash("gh-token", impl)).toBe(body)
+  expect(seen[0].url).toBe(`https://api.github.com/repos/${OWNER}/${REPO}/contents/build-hash.txt`)
+  expect(seen[0].auth).toBe("Bearer gh-token")
+})
+
+test("a missing published hash reads as 'none published', and says why that happens", async () => {
+  const { fetchPublishedHash, compareBuildHash } = await import("../../src/ui/settings")
+  const missing = (async () => new Response("", { status: 404 })) as unknown as typeof fetch
+  expect(await fetchPublishedHash("gh-token", missing)).toBeNull()
+
+  // The message must name the real cause rather than the symptom: a Deploy-button clone does
+  // not include .github/workflows, because Vercel's GitHub App cannot write workflow files --
+  // confirmed on a real deployment whose cloned repo had every other file and no .github.
+  //
+  // Asserted on the constant directly: the branch using it is unreachable from here, because
+  // BUILD_COMMIT is always "dev" under test and compareBuildHash short-circuits earlier. That
+  // short-circuit is itself correct and is covered by its own test above.
+  const { NO_PUBLISHED_HASH_REASON } = await import("../../src/ui/settings")
+  expect(NO_PUBLISHED_HASH_REASON).toMatch(/workflow/i)
+  expect(NO_PUBLISHED_HASH_REASON).toMatch(/Deploy button/i)
+  expect(compareBuildHash("a".repeat(64), null).kind).toBe("unverifiable")
+})

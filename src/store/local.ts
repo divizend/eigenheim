@@ -19,7 +19,7 @@ export const DB_NAME = "eigenheim"
 const DB_VERSION = 1
 const STORE_NAME = "slots"
 
-type SlotKey = "wrappedIdentity" | "token" | "draft" | "cachedVault" | "pendingCommits"
+type SlotKey = "wrappedIdentity" | "token" | "draft" | "cachedVault" | "pendingCommits" | "repo"
 
 /** The in-progress document plus the commit it was last synced against
  * (`baseSha`), and when it was saved -- `savedAt` is what lets
@@ -273,6 +273,31 @@ export class LocalStore {
     const store = tx.objectStore(STORE_NAME)
     store.put(next.cachedVault, "cachedVault")
     store.put(next.wrappedIdentity, "wrappedIdentity")
+    await transactionDone(tx)
+  }
+
+  /** Which GitHub repository this device's vault lives in, when the user has chosen one that
+   * differs from the deployment's own build-time default (see src/config.ts).
+   *
+   * Deliberately NOT encrypted: a repository name is not a secret — it is visible in every URL
+   * the app opens and in the transfer code — and storing it in the clear is what lets
+   * src/main.ts read it before any passphrase exists, which is the whole point. */
+  async putRepo(repo: { owner: string; slug: string }): Promise<void> {
+    await this.putSlot("repo", repo)
+  }
+
+  async getRepo(): Promise<{ owner: string; slug: string } | null> {
+    return this.getSlot<{ owner: string; slug: string }>("repo")
+  }
+
+  /** Drops the cached vault, for when it no longer describes the repository this device points
+   * at (task: changing the repository in Settings). Safe by construction: the cache is only
+   * ever an optimisation — `src/session/unlock.ts` falls back to fetching from GitHub whenever
+   * it is absent, which is precisely the behaviour wanted after a change. */
+  async clearCachedVault(): Promise<void> {
+    const db = await this.db()
+    const tx = db.transaction(STORE_NAME, "readwrite")
+    tx.objectStore(STORE_NAME).delete("cachedVault")
     await transactionDone(tx)
   }
 

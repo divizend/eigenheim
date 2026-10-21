@@ -13,7 +13,7 @@ import QRCode from "qrcode"
 import type { GithubStore } from "../store/github"
 import type { LocalStore } from "../store/local"
 import type { Session } from "../session/unlock"
-import { BUILD_COMMIT, repoOwner, repoSlug, VAULT_PATH } from "../config"
+import { BUILD_COMMIT, repoOwner, repoSlug, setRuntimeRepo, VAULT_PATH, DATA_BRANCH } from "../config"
 import { encryptVault, encryptToRecipient } from "../vault/crypto"
 import { wrapIdentity, recipientFor } from "../vault/identity"
 import { checkPassphrase, normalizePassphrase } from "../vault/passphrase"
@@ -147,6 +147,66 @@ export async function changePassphrase(
   return { kind: "changed" }
 }
 
+/** A direct link to the encrypted file as GitHub renders it. The one place in the UI that
+ * shows the user, in GitHub's own interface, that what is stored really is ciphertext. */
+export function vaultFileUrl(): string {
+  return `https://github.com/${repoOwner()}/${repoSlug()}/blob/${DATA_BRANCH}/${VAULT_PATH}`
+}
+
+export type RepoChange =
+  | { kind: "changed" }
+  | { kind: "rejected"; message: string }
+  | { kind: "unsaved-draft" }
+
+/** Points this device at a different GitHub repository.
+ *
+ * Validated against the real repository before anything is stored, with the same `ensureSetup`
+ * the setup wizard uses — so a repository that is public, missing, or not writable by this
+ * token is refused here rather than at the next save.
+ *
+ * Refuses outright while an unsaved draft exists, and that is the important part: the draft is
+ * text the user has typed but not committed, and it belongs to the OLD repository's vault. Any
+ * other behaviour either silently discards their work or carries it into a vault it was never
+ * part of. Making them save or discard first is the only option that cannot lose anything.
+ *
+ * Clears the cached vault, because it is the old repository's ciphertext and the new repository
+ * has its own. The wrapped identity and the token are deliberately kept: neither is
+ * repository-specific, and re-deriving them would cost the user their passphrase prompt and
+ * their token for no reason. */
+export async function changeRepo(
+  owner: string,
+  slug: string,
+  session: Session,
+  io: SessionIO,
+  makeStoreFor: (owner: string, slug: string, token: string) => GithubStore,
+): Promise<RepoChange> {
+  const cleanOwner = owner.trim()
+  const cleanSlug = slug.trim()
+  if (cleanOwner.length === 0 || cleanSlug.length === 0) {
+    return { kind: "rejected", message: "Enter both the owner and the repository name." }
+  }
+  if (!/^[\w.-]+$/.test(cleanOwner) || !/^[\w.-]+$/.test(cleanSlug)) {
+    return { kind: "rejected", message: "That does not look like a GitHub owner and repository name." }
+  }
+  if (session.token === null) {
+    return { kind: "rejected", message: "This device has no GitHub token, so a new repository cannot be checked." }
+  }
+  if ((await io.local.getDraft()) !== null) {
+    return { kind: "unsaved-draft" }
+  }
+
+  try {
+    await makeStoreFor(cleanOwner, cleanSlug, session.token).ensureSetup()
+  } catch (err) {
+    return { kind: "rejected", message: err instanceof Error ? err.message : String(err) }
+  }
+
+  await io.local.putRepo({ owner: cleanOwner, slug: cleanSlug })
+  await io.local.clearCachedVault()
+  setRuntimeRepo({ owner: cleanOwner, slug: cleanSlug })
+  return { kind: "changed" }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Supply-chain integrity (spec §10.2, ruling R2)
 // ---------------------------------------------------------------------------------------------
@@ -163,6 +223,39 @@ export async function measureRunningBundle(url: string, fetchImpl: typeof fetch 
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("")
 }
 
+/** Reads CI's published `build-hash.txt` out of the repository.
+ *
+ * Through the GitHub API with the session's token, NOT raw.githubusercontent.com. The original
+ * used the raw host, which 404s for a PRIVATE repository — and this design REQUIRES the
+ * repository to be private, so the integrity panel could never verify anything on a real
+ * deployment. Reported from exactly that: a live private deployment reading "Cannot verify the
+ * running code".
+ *
+ * Returns null when there is genuinely nothing to read, so the caller can tell "no hash
+ * published" apart from "a hash that does not match" — two very different things to show. */
+export async function fetchPublishedHash(
+  token: string | null,
+  fetchImpl: typeof fetch = fetch,
+): Promise<string | null> {
+  const url = `https://api.github.com/repos/${repoOwner()}/${repoSlug()}/contents/build-hash.txt`
+  try {
+    const res = await fetchImpl(url, {
+      cache: "no-store",
+      headers: {
+        accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+    })
+    if (!res.ok) return null
+    const body = (await res.json()) as { content?: string; encoding?: string }
+    if (typeof body.content !== "string") return null
+    return atob(body.content.replace(/\s/g, ""))
+  } catch {
+    return null
+  }
+}
+
 /** Parses CI's published `build-hash.txt`, whose format is `<commit> <sha256-of-bundle>` on one
  * line (ruling R2; written by task 21's CI job). Returns null for anything else rather than
  * guessing, so a malformed or missing file reads as "cannot verify" rather than "mismatch". */
@@ -170,6 +263,19 @@ export function parseBuildHashFile(text: string): { commit: string; sha256: stri
   const match = /^([0-9a-f]{7,40})\s+([0-9a-f]{64})\s*$/im.exec(text.trim())
   return match ? { commit: match[1], sha256: match[2] } : null
 }
+
+/** Why no hash could be read, stated as the actual cause rather than the symptom.
+ *
+ * On a repository created by the Deploy button this is near-certain, and it is NOT the user's
+ * mistake: Vercel's GitHub App cannot write workflow files, so `.github/workflows/` is silently
+ * dropped from the clone and the job that publishes this hash has never run there. Confirmed on
+ * a real deployment whose cloned repository contained every other file and no `.github` at all.
+ *
+ * A named constant rather than an inline string so it can be asserted directly — the branch
+ * that uses it is unreachable in tests, where `BUILD_COMMIT` is always "dev" and
+ * {@link compareBuildHash} short-circuits earlier. */
+export const NO_PUBLISHED_HASH_REASON =
+  "no hash has been published for this repository yet. If it was created by the Deploy button, its clone did not include .github/workflows (Vercel cannot copy workflow files), so the job that publishes the hash has never run. Copy that directory from the template repository and push once to enable this check."
 
 /** The verdict shown to the user. `unverifiable` is deliberately distinct from `mismatch`: not
  * being able to check is not the same as having checked and found a difference, and collapsing
@@ -188,11 +294,7 @@ export function compareBuildHash(running: string | null, publishedText: string |
     return { kind: "unverifiable", reason: "The running bundle could not be read to hash it.", running: null }
   }
   if (publishedText === null) {
-    return {
-      kind: "unverifiable",
-      reason: "No published hash could be fetched for this build, so there is nothing to compare against.",
-      running,
-    }
+    return { kind: "unverifiable", reason: NO_PUBLISHED_HASH_REASON, running }
   }
   const published = parseBuildHashFile(publishedText)
   if (published === null) {
@@ -221,6 +323,14 @@ export interface SettingsDeps {
   /** The text currently in the editor — what a passphrase rotation re-encrypts. */
   text: string
   onClose: () => void
+  /** Called after the stored repository changes. src/main.ts reloads: the open session, the
+   * cached vault and every view on screen all belong to the previous repository. */
+  onRepoChanged: () => void
+  /** Builds a store for an ARBITRARY repository, not the configured one — the seam that lets a
+   * candidate repository be validated before it is stored, without this view importing
+   * `GithubStore` itself (ruling R3's convention). `SessionIO.makeStore` cannot serve here
+   * because it is bound to whichever repository is currently configured. */
+  makeStoreFor: (owner: string, slug: string, token: string) => GithubStore
   /** Injectable only so tests can drive the integrity panel without a network; production passes
    * nothing and the real `fetch` is used. */
   fetchImpl?: typeof fetch
@@ -257,6 +367,26 @@ export function renderSettings(root: HTMLElement, deps: SettingsDeps): void {
           <textarea id="qr-text" data-testid="qr-text" readonly rows="3"></textarea>
           <button type="button" id="hide-qr">Hide it again</button>
         </div>
+      </section>
+
+      <section class="settings-block">
+        <h2>Where your vault is stored</h2>
+        <p>Your encrypted file lives on the <code>${DATA_BRANCH}</code> branch of
+          <code data-testid="current-repo">${repoOwner()}/${repoSlug()}</code>. It is ciphertext —
+          you can look at it yourself:</p>
+        <p><a id="vault-link" data-testid="vault-link" target="_blank" rel="noopener">View ${VAULT_PATH} on GitHub</a></p>
+        <details class="settings-advanced">
+          <summary>Store it in a different repository</summary>
+          <p>The repository must already be private and writable by this device's token. Your
+            passphrase and this device's identity are unchanged — only where the file is kept.
+            Save any unsaved text first: it belongs to the vault you are moving away from.</p>
+          <label for="repo-owner">Owner</label>
+          <input type="text" id="repo-owner" data-testid="repo-owner" autocomplete="off" spellcheck="false">
+          <label for="repo-slug">Repository</label>
+          <input type="text" id="repo-slug" data-testid="repo-slug" autocomplete="off" spellcheck="false">
+          <p id="repo-feedback" class="wizard-feedback" data-testid="repo-feedback" role="alert" hidden></p>
+          <button type="button" id="save-repo" data-testid="save-repo">Check and use this repository</button>
+        </details>
       </section>
 
       <section class="settings-block">
@@ -316,6 +446,32 @@ export function renderSettings(root: HTMLElement, deps: SettingsDeps): void {
     revealBtn.hidden = false
   })
 
+  // --- where the vault is stored ---------------------------------------------------------------
+  const vaultLink = required<HTMLAnchorElement>(root, "#vault-link")
+  vaultLink.href = vaultFileUrl()
+
+  const repoOwnerInput = required<HTMLInputElement>(root, "#repo-owner")
+  const repoSlugInput = required<HTMLInputElement>(root, "#repo-slug")
+  const repoFeedback = required<HTMLParagraphElement>(root, "#repo-feedback")
+  repoOwnerInput.value = repoOwner()
+  repoSlugInput.value = repoSlug()
+
+  required<HTMLButtonElement>(root, "#save-repo").addEventListener("click", () => {
+    void (async () => {
+      repoFeedback.hidden = true
+      const outcome = await changeRepo(repoOwnerInput.value, repoSlugInput.value, session, io, deps.makeStoreFor)
+      if (outcome.kind === "changed") {
+        deps.onRepoChanged()
+        return
+      }
+      repoFeedback.textContent =
+        outcome.kind === "unsaved-draft"
+          ? "You have text that is not saved to GitHub yet. Save it (⌘S / Ctrl+S) or discard it first — it belongs to the vault you are moving away from, so it cannot come with you."
+          : outcome.message
+      repoFeedback.hidden = false
+    })()
+  })
+
   // --- token ---------------------------------------------------------------------------------
   const tokenFeedback = required<HTMLParagraphElement>(root, "#token-feedback")
   required<HTMLButtonElement>(root, "#save-token").addEventListener("click", () => {
@@ -367,15 +523,7 @@ export function renderSettings(root: HTMLElement, deps: SettingsDeps): void {
       running = null
     }
 
-    let publishedText: string | null = null
-    try {
-      const res = await fetchImpl(
-        `https://raw.githubusercontent.com/${repoOwner()}/${repoSlug()}/main/build-hash.txt`,
-      )
-      publishedText = res.ok ? await res.text() : null
-    } catch {
-      publishedText = null
-    }
+    const publishedText = await fetchPublishedHash(session.token, fetchImpl)
 
     const verdict = compareBuildHash(running, publishedText)
     out.textContent =
